@@ -1,8 +1,13 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, status
+from fastapi.responses import StreamingResponse
 from app.services.zip_handler import ZipHandler
 from app.services.processing_orchestrator import orchestrator
 from app.schemas.invoice_schema import ProcessingResponse
 from app.utils.logger import setup_logger
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from datetime import datetime
 
 logger = setup_logger("upload_router")
 
@@ -10,7 +15,111 @@ router = APIRouter()
 
 zip_handler = ZipHandler()
 
-@router.post("/process-zip", response_model=ProcessingResponse)
+def create_excel_from_results(processing_response: ProcessingResponse, filename: str) -> io.BytesIO:
+    """Convert processing results to Excel file"""
+    wb = Workbook()
+    
+    # Sheet 1: Invoices Summary
+    ws_summary = wb.active
+    ws_summary.title = "Resumen Facturas"
+    
+    # Header styling
+    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    
+    # Headers for summary
+    headers = [
+        "Nro. Factura", "Fecha", "Proveedor", "RUC Proveedor", 
+        "Cliente", "Subtotal", "IGV", "Total", "Moneda",
+        "Confianza", "Archivo Origen", "Secuencia"
+    ]
+    
+    for col, header in enumerate(headers, 1):
+        cell = ws_summary.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    
+    # Data rows
+    for row_idx, invoice in enumerate(processing_response.results, 2):
+        ws_summary.cell(row=row_idx, column=1, value=invoice.invoice_number or "")
+        ws_summary.cell(row=row_idx, column=2, value=invoice.invoice_date or "")
+        ws_summary.cell(row=row_idx, column=3, value=invoice.supplier_name or "")
+        ws_summary.cell(row=row_idx, column=4, value=invoice.supplier_ruc or "")
+        ws_summary.cell(row=row_idx, column=5, value=invoice.customer_name or "")
+        ws_summary.cell(row=row_idx, column=6, value=invoice.subtotal)
+        ws_summary.cell(row=row_idx, column=7, value=invoice.tax)
+        ws_summary.cell(row=row_idx, column=8, value=invoice.total)
+        ws_summary.cell(row=row_idx, column=9, value=invoice.currency or "")
+        ws_summary.cell(row=row_idx, column=10, value=invoice.confidence_score)
+        ws_summary.cell(row=row_idx, column=11, value=invoice.source_file)
+        ws_summary.cell(row=row_idx, column=12, value=invoice.sequence_id)
+    
+    # Auto-adjust column widths
+    for col in range(1, len(headers) + 1):
+        ws_summary.column_dimensions[ws_summary.cell(row=1, column=col).column_letter].width = 15
+    
+    # Sheet 2: Items Detail
+    ws_items = wb.create_sheet("Detalle Items")
+    
+    item_headers = [
+        "Nro. Factura", "Archivo Origen", "Item", "Descripción",
+        "Cantidad", "Unidad", "Precio Unit.", "Total Item"
+    ]
+    
+    for col, header in enumerate(item_headers, 1):
+        cell = ws_items.cell(row=1, column=col, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    
+    # Items data
+    item_row = 2
+    for invoice in processing_response.results:
+        if invoice.items:
+            for item_idx, item in enumerate(invoice.items, 1):
+                ws_items.cell(row=item_row, column=1, value=invoice.invoice_number or "")
+                ws_items.cell(row=item_row, column=2, value=invoice.source_file)
+                ws_items.cell(row=item_row, column=3, value=item_idx)
+                ws_items.cell(row=item_row, column=4, value=item.description or "")
+                ws_items.cell(row=item_row, column=5, value=item.quantity)
+                ws_items.cell(row=item_row, column=6, value=item.unit or "")
+                ws_items.cell(row=item_row, column=7, value=item.unit_price)
+                ws_items.cell(row=item_row, column=8, value=item.total_price)
+                item_row += 1
+    
+    # Auto-adjust column widths
+    for col in range(1, len(item_headers) + 1):
+        ws_items.column_dimensions[ws_items.cell(row=1, column=col).column_letter].width = 18
+    
+    # Sheet 3: Errors
+    if processing_response.errors:
+        ws_errors = wb.create_sheet("Errores")
+        
+        error_headers = ["Archivo", "Secuencia", "Tipo", "Error"]
+        for col, header in enumerate(error_headers, 1):
+            cell = ws_errors.cell(row=1, column=col, value=header)
+            cell.fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        
+        for row_idx, error in enumerate(processing_response.errors, 2):
+            ws_errors.cell(row=row_idx, column=1, value=error.get("file", ""))
+            ws_errors.cell(row=row_idx, column=2, value=error.get("sequence_id", ""))
+            ws_errors.cell(row=row_idx, column=3, value=error.get("file_type", ""))
+            ws_errors.cell(row=row_idx, column=4, value=error.get("error", ""))
+        
+        for col in range(1, len(error_headers) + 1):
+            ws_errors.column_dimensions[ws_errors.cell(row=1, column=col).column_letter].width = 20
+    
+    # Save to BytesIO
+    excel_file = io.BytesIO()
+    wb.save(excel_file)
+    excel_file.seek(0)
+    
+    return excel_file
+
+@router.post("/process-zip")
 async def process_zip_file(file: UploadFile = File(...)):
     """
     Process a ZIP file from WhatsApp and extract invoice data
@@ -104,7 +213,20 @@ async def process_zip_file(file: UploadFile = File(...)):
             error_count=len(processing_response.errors)
         )
         
-        return processing_response
+        # Generate Excel file
+        excel_file = create_excel_from_results(processing_response, file.filename)
+        
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        excel_filename = f"facturas_{timestamp}.xlsx"
+        
+        return StreamingResponse(
+            excel_file,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={excel_filename}"
+            }
+        )
         
     except HTTPException:
         # Re-raise HTTP exceptions
