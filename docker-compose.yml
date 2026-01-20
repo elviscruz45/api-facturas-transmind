@@ -1,0 +1,50 @@
+services:
+  api-facturas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: api-facturas
+    ports:
+      - "8000:8000"
+    environment:
+      # Google Cloud Configuration
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-facturacion-484614}
+      # Note: In production/Cloud Run, use service account instead of JSON file
+      # - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+
+      # API Configuration
+      - DEBUG=false
+      - MAX_FILE_SIZE_MB=300
+
+      # Gemini Configuration
+      - GEMINI_MODEL=gemini-2.5-flash-lite
+      - GEMINI_LOCATION=us-central1
+      - GEMINI_CONCURRENCY_LIMIT=5
+      - GEMINI_TIMEOUT_SECONDS=30
+
+    # Mount credentials (for local development only - DO NOT use in production)
+    # volumes:
+    #   - ./credentials:/app/credentials:ro
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    restart: unless-stopped
+
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+networks:
+  default:
+    name: api-facturas-network
