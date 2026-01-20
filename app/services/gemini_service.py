@@ -3,10 +3,12 @@ import asyncio
 from typing import Dict, Optional
 from vertexai.generative_models import GenerativeModel, Part
 from google.cloud import aiplatform
+from google.api_core import retry, exceptions
 from config import settings
 from app.utils.auth import vertex_auth
 from app.schemas.invoice_schema import InvoiceSchema
 from app.utils.logger import setup_logger
+import time
 
 logger = setup_logger("gemini_service")
 
@@ -185,22 +187,87 @@ Rules:
                 )
     
     async def _call_gemini_async(self, image_part: Part, prompt: str) -> str:
-        """Make async call to Gemini with image"""
-        def _sync_call():
-            response = self.model.generate_content([image_part, prompt])
-            return response.text
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _sync_call)
+        """Make async call to Gemini with image and automatic retries for rate limits"""
+        max_retries = 3
+        base_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                def _sync_call():
+                    response = self.model.generate_content([image_part, prompt])
+                    return response.text
+                
+                # Run in thread pool to avoid blocking
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, _sync_call)
+                
+            except Exception as e:
+                error_str = str(e)
+                
+                # Check if it's a 429 error (rate limit)
+                if "429" in error_str or "Resource exhausted" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 2s, 4s, 8s
+                        delay = base_delay * (2 ** attempt)
+                        logger.log_warning(
+                            f"Rate limit hit (429), retrying in {delay}s",
+                            attempt=attempt + 1,
+                            max_retries=max_retries
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.log_error(
+                            "Max retries reached for rate limit",
+                            attempts=max_retries
+                        )
+                        raise Exception("Rate limit exceeded after retries. Please reduce concurrency or try again later.")
+                else:
+                    # Not a rate limit error, raise immediately
+                    raise
+        
+        raise Exception("Failed after all retry attempts")
     
     async def _call_gemini_text_async(self, prompt: str) -> str:
-        """Make async call to Gemini with text only"""
-        def _sync_call():
-            response = self.model.generate_content(prompt)
-            return response.text
+        """Make async call to Gemini with text only and automatic retries"""
+        max_retries = 3
+        base_delay = 2  # seconds
         
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _sync_call)
+        for attempt in range(max_retries):
+            try:
+                def _sync_call():
+                    response = self.model.generate_content(prompt)
+                    return response.text
+                
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, _sync_call)
+                
+            except Exception as e:
+                error_str = str(e)
+                
+                # Check if it's a 429 error (rate limit)
+                if "429" in error_str or "Resource exhausted" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    if attempt < max_retries - 1:
+                        # Exponential backoff: 2s, 4s, 8s
+                        delay = base_delay * (2 ** attempt)
+                        logger.log_warning(
+                            f"Rate limit hit (429), retrying in {delay}s",
+                            attempt=attempt + 1,
+                            max_retries=max_retries
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.log_error(
+                            "Max retries reached for rate limit",
+                            attempts=max_retries
+                        )
+                        raise Exception("Rate limit exceeded after retries. Please reduce concurrency or try again later.")
+                else:
+                    # Not a rate limit error, raise immediately
+                    raise
+        
+        raise Exception("Failed after all retry attempts")
     
     def _parse_gemini_response(self, response_text: str, filename: str, 
                               sequence_id: int) -> Dict:

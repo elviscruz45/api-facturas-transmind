@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     google_application_credentials: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
     gemini_model: str = "gemini-2.5-flash-lite"
     gemini_location: str = "us-central1"
-    gemini_concurrency_limit: int = 5
+    gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "2"))  # Reducido de 5 a 2
     gemini_timeout_seconds: int = 30
     
     # Processing Configuration
