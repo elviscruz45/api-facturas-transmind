@@ -6,25 +6,29 @@ services:
     container_name: api-facturas
     ports:
       - "8000:8000"
+
+    # Load environment variables from .env file
+    env_file:
+      - .env
+
     environment:
       # Google Cloud Configuration
-      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT:-facturacion-484614}
-      # Note: In production/Cloud Run, use service account instead of JSON file
-      # - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/service-account.json
 
       # API Configuration
-      - DEBUG=false
-      - MAX_FILE_SIZE_MB=300
+      - DEBUG=${DEBUG:-false}
+      - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-300}
 
       # Gemini Configuration
-      - GEMINI_MODEL=gemini-2.5-flash-lite
-      - GEMINI_LOCATION=us-central1
-      - GEMINI_CONCURRENCY_LIMIT=5
-      - GEMINI_TIMEOUT_SECONDS=30
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+      - GEMINI_LOCATION=${GEMINI_LOCATION:-us-central1}
+      - GEMINI_CONCURRENCY_LIMIT=${GEMINI_CONCURRENCY_LIMIT:-5}
+      - GEMINI_TIMEOUT_SECONDS=${GEMINI_TIMEOUT_SECONDS:-30}
 
-    # Mount credentials (for local development only - DO NOT use in production)
-    # volumes:
-    #   - ./credentials:/app/credentials:ro
+    # Mount credentials file for local development
+    volumes:
+      - ./facturacion-484614-c2985e715326.json:/app/credentials/service-account.json:ro
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
