@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import upload
+from app.routers import upload, storage
 from app.utils.logger import setup_logger
 
 # Initialize logger
@@ -23,6 +23,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(upload.router, prefix="/api/v1", tags=["upload"])
+app.include_router(storage.router, prefix="/api/v1", tags=["storage"])
 
 @app.get("/")
 async def root():

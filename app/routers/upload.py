@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, status
 from fastapi.responses import StreamingResponse
 from app.services.zip_handler import ZipHandler
 from app.services.processing_orchestrator import orchestrator
+from app.services.storage_service import storage_service
 from app.schemas.invoice_schema import ProcessingResponse
 from app.utils.logger import setup_logger
 import io
@@ -153,6 +154,26 @@ async def process_zip_file(file: UploadFile = File(...)):
             size_bytes=len(file_content)
         )
         
+        # Upload ZIP to Cloud Storage (backup y audit trail)
+        storage_metadata = storage_service.upload_zip(
+            file_content, 
+            file.filename,
+            company_id=None  # TODO: extraer de headers o auth cuando implementes multi-tenancy
+        )
+        
+        if storage_metadata:
+            logger.log_info(
+                "ZIP backed up to Cloud Storage",
+                blob_path=storage_metadata["blob_path"],
+                signed_url=storage_metadata["signed_url"]
+            )
+        else:
+            # No falla si no se puede subir a Storage (degrada gracefully)
+            logger.log_warning(
+                "Failed to backup ZIP to Cloud Storage, continuing with processing",
+                filename=file.filename
+            )
+        
         # Phase 1: Extract and validate ZIP
         success, extraction_result = zip_handler.extract_zip_files(file_content, file.filename)
         
@@ -216,16 +237,44 @@ async def process_zip_file(file: UploadFile = File(...)):
         # Generate Excel file
         excel_file = create_excel_from_results(processing_response, file.filename)
         
+        # Upload Excel to Cloud Storage
+        excel_metadata = storage_service.upload_excel(
+            excel_file,
+            file.filename,
+            company_id=None  # TODO: extraer de headers o auth
+        )
+        
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         excel_filename = f"facturas_{timestamp}.xlsx"
         
+        # Prepare response headers
+        response_headers = {
+            "Content-Disposition": f"attachment; filename={excel_filename}",
+            "X-Total-Files": str(len(extracted_files)),
+            "X-Success-Files": str(processing_response.success_count),
+            "X-Error-Files": str(len(processing_response.errors))
+        }
+        
+        # Add Cloud Storage URLs to headers if upload succeeded
+        if excel_metadata:
+            response_headers["X-Storage-Excel-URL"] = excel_metadata["signed_url"]
+            logger.log_info(
+                "Excel saved to Cloud Storage",
+                blob_path=excel_metadata["blob_path"],
+                excel_url=excel_metadata["signed_url"]
+            )
+        
+        if storage_metadata:
+            response_headers["X-Storage-Zip-URL"] = storage_metadata["signed_url"]
+        
+        # Reset BytesIO position for streaming
+        excel_file.seek(0)
+        
         return StreamingResponse(
             excel_file,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": f"attachment; filename={excel_filename}"
-            }
+            headers=response_headers
         )
         
     except HTTPException:
