@@ -20,6 +20,14 @@ class Settings(BaseSettings):
     gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "1"))  # Secuencial para evitar rate limits
     gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))  # 3 minutos para permitir reintentos
     
+    
+    # Cloud Storage Configuration
+    storage_bucket_name: str = os.getenv("STORAGE_BUCKET_NAME", "facturacion-484614-invoices")
+    storage_upload_folder: str = "uploads"
+    storage_result_folder: str = "results"
+    storage_retention_days: int = 90
+    
+    
     # Processing Configuration
     max_files_per_batch: int = 100
     encoding_fallback_sequence: List[str] = ["utf-8", "latin-1", "cp1252"]

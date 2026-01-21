@@ -2,6 +2,7 @@
 Cloud Storage service for managing uploaded ZIPs and processed files
 """
 from google.cloud import storage
+from google.oauth2 import service_account
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 import os
@@ -19,11 +20,27 @@ class StorageService:
         self.bucket_name = os.getenv("STORAGE_BUCKET_NAME", f"{self.project_id}-invoices")
         self.client = None
         self.bucket = None
+        self.can_sign_urls = False  # Flag para saber si podemos generar signed URLs
         
     def initialize(self) -> bool:
         """Initialize Cloud Storage client and bucket"""
         try:
+            # Initialize client - usa ADC (Application Default Credentials)
             self.client = storage.Client(project=self.project_id)
+            
+            # Detectar si podemos generar signed URLs
+            try:
+                # Test si las credenciales pueden firmar
+                creds = self.client._credentials
+                if hasattr(creds, 'sign_bytes') or isinstance(creds, service_account.Credentials):
+                    self.can_sign_urls = True
+                    logger.log_info("Service account credentials detected - signed URLs available")
+                else:
+                    self.can_sign_urls = False
+                    logger.log_info("User credentials detected - signed URLs not available, using public URLs")
+            except Exception:
+                self.can_sign_urls = False
+                logger.log_info("Could not detect credential type - signed URLs disabled")
             
             # Get or create bucket
             try:
@@ -60,6 +77,26 @@ class StorageService:
                 error=str(e)
             )
             return False
+    
+    def _generate_url_with_fallback(self, blob, days: int = 7) -> str:
+        """Generate signed URL with fallback to public URL if signing fails"""
+        if not self.can_sign_urls:
+            # Si sabemos que no podemos firmar, devolver public URL directamente
+            return blob.public_url if blob.public_url else f"gs://{self.bucket_name}/{blob.name}"
+        
+        try:
+            # Intentar generar signed URL
+            return blob.generate_signed_url(
+                expiration=timedelta(days=days),
+                method="GET"
+            )
+        except Exception as e:
+            logger.log_warning(
+                "Failed to generate signed URL, using fallback",
+                error=str(e)[:100],  # Truncar error para logs
+                blob_name=blob.name
+            )
+            return blob.public_url if blob.public_url else f"gs://{self.bucket_name}/{blob.name}"
     
     def upload_zip(self, file_content: bytes, original_filename: str, 
                    company_id: Optional[str] = None) -> Optional[Dict]:
@@ -104,11 +141,8 @@ class StorageService:
                 content_type="application/zip"
             )
             
-            # Generate signed URL (valid for 7 days)
-            signed_url = blob.generate_signed_url(
-                expiration=timedelta(days=7),
-                method="GET"
-            )
+            # Generate URL (signed if possible, public otherwise)
+            signed_url = self._generate_url_with_fallback(blob, days=7)
             
             logger.log_info(
                 "ZIP uploaded to Cloud Storage",
@@ -178,11 +212,8 @@ class StorageService:
                 content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
             
-            # Generate signed URL (valid for 30 days)
-            signed_url = blob.generate_signed_url(
-                expiration=timedelta(days=30),
-                method="GET"
-            )
+            # Generate URL (signed if possible, public otherwise)
+            signed_url = self._generate_url_with_fallback(blob, days=30)
             
             logger.log_info(
                 "Excel uploaded to Cloud Storage",
