@@ -119,8 +119,8 @@ Rules:
                     timeout=self.timeout_seconds
                 )
                 
-                # Delay entre requests para respetar rate limit (6s = ~10 RPM, optimizado para horas pico)
-                await asyncio.sleep(6)
+                # Delay entre requests para respetar rate limit (10s = ~6 RPM, muy conservador para horas pico extremas)
+                await asyncio.sleep(10)
                 
                 # Parse response
                 return self._parse_gemini_response(response, filename, sequence_id)
@@ -176,8 +176,8 @@ Rules:
                     timeout=self.timeout_seconds
                 )
                 
-                # Delay entre requests para respetar rate limit (6s = ~10 RPM, optimizado para horas pico)
-                await asyncio.sleep(6)
+                # Delay entre requests para respetar rate limit (10s = ~6 RPM, muy conservador para horas pico extremas)
+                await asyncio.sleep(10)
                 
                 return self._parse_gemini_response(response, filename, sequence_id)
                 

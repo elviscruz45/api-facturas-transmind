@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
     gemini_location: str = os.getenv("GEMINI_LOCATION", "us-east4")
     gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "1"))
-    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))  # Aumentado a 180s para horas pico
+    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "420"))  # 7 minutos para permitir todos los reintentos
     
     # Processing Configuration
     max_files_per_batch: int = 100
