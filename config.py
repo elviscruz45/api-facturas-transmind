@@ -12,13 +12,13 @@ class Settings(BaseSettings):
     allowed_extensions: List[str] = [".txt", ".jpg", ".png", ".jpeg", ".pdf"]
     temp_dir: str = "/tmp/invoice_processing"
     
-    # Vertex AI Configuration
+    # Vertex AI Configuration (Optimizado para Free Tier - 15 RPM)
     google_cloud_project: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
     google_application_credentials: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
     gemini_location: str = os.getenv("GEMINI_LOCATION", "us-east4")
-    gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "1"))
-    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "420"))  # 7 minutos para permitir todos los reintentos
+    gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "1"))  # Secuencial para evitar rate limits
+    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))  # 3 minutos para permitir reintentos
     
     # Processing Configuration
     max_files_per_batch: int = 100

@@ -1,7 +1,7 @@
 import json
 import asyncio
 from typing import Dict, Optional
-from vertexai.generative_models import GenerativeModel, Part
+from vertexai.generative_models import GenerativeModel, Part, GenerationConfig
 from google.cloud import aiplatform
 from google.api_core import retry, exceptions
 from config import settings
@@ -20,6 +20,12 @@ class GeminiService:
         self.timeout_seconds = settings.gemini_timeout_seconds
         self.model = None
         self.semaphore = asyncio.Semaphore(settings.gemini_concurrency_limit)
+        
+        # Configuración para forzar respuestas JSON limpias (sin markdown)
+        self.generation_config = GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.1  # Baja temperatura para respuestas más deterministas
+        )
         
         # Invoice extraction prompt template
         self.invoice_prompt = """
@@ -119,8 +125,8 @@ Rules:
                     timeout=self.timeout_seconds
                 )
                 
-                # Delay entre requests para respetar rate limit (10s = ~6 RPM, muy conservador para horas pico extremas)
-                await asyncio.sleep(10)
+                # Delay conservador para 15 RPM (6s = ~10 requests/min con margen de seguridad)
+                await asyncio.sleep(6)
                 
                 # Parse response
                 return self._parse_gemini_response(response, filename, sequence_id)
@@ -176,8 +182,8 @@ Rules:
                     timeout=self.timeout_seconds
                 )
                 
-                # Delay entre requests para respetar rate limit (10s = ~6 RPM, muy conservador para horas pico extremas)
-                await asyncio.sleep(10)
+                # Delay conservador para 15 RPM (6s = ~10 requests/min con margen de seguridad)
+                await asyncio.sleep(6)
                 
                 return self._parse_gemini_response(response, filename, sequence_id)
                 
@@ -194,13 +200,16 @@ Rules:
     
     async def _call_gemini_async(self, image_part: Part, prompt: str) -> str:
         """Make async call to Gemini with image and automatic retries for rate limits"""
-        max_retries = 7  # Aumentado para horas pico
-        base_delay = 5  # Backoff: 5s, 10s, 20s, 40s, 80s, 160s
+        max_retries = 5  # Más reintentos para manejar rate limits de 15 RPM
+        base_delay = 3  # Backoff exponencial (3s, 6s, 12s, 24s, 48s)
         
         for attempt in range(max_retries):
             try:
                 def _sync_call():
-                    response = self.model.generate_content([image_part, prompt])
+                    response = self.model.generate_content(
+                        [image_part, prompt],
+                        generation_config=self.generation_config
+                    )
                     return response.text
                 
                 # Run in thread pool to avoid blocking
@@ -236,13 +245,16 @@ Rules:
     
     async def _call_gemini_text_async(self, prompt: str) -> str:
         """Make async call to Gemini with text only and automatic retries"""
-        max_retries = 7  # Aumentado para horas pico
-        base_delay = 5  # Backoff: 5s, 10s, 20s, 40s, 80s, 160s
+        max_retries = 5  # Más reintentos para manejar rate limits de 15 RPM
+        base_delay = 3  # Backoff exponencial (3s, 6s, 12s, 24s, 48s)
         
         for attempt in range(max_retries):
             try:
                 def _sync_call():
-                    response = self.model.generate_content(prompt)
+                    response = self.model.generate_content(
+                        prompt,
+                        generation_config=self.generation_config
+                    )
                     return response.text
                 
                 loop = asyncio.get_event_loop()
@@ -277,23 +289,14 @@ Rules:
     
     def _parse_gemini_response(self, response_text: str, filename: str, 
                               sequence_id: int) -> Dict:
-        """Parse Gemini JSON response into InvoiceSchema"""
+        """Parse Gemini JSON response into InvoiceSchema
+        
+        Ahora mucho más seguro porque generation_config con response_mime_type='application/json'
+        garantiza que Gemini devuelva JSON limpio sin markdown.
+        """
         try:
-            # Clean response text
-            cleaned_response = response_text.strip()
-            
-            # Remove any markdown code blocks
-            if cleaned_response.startswith('```json'):
-                cleaned_response = cleaned_response[7:]
-            if cleaned_response.startswith('```'):
-                cleaned_response = cleaned_response[3:]
-            if cleaned_response.endswith('```'):
-                cleaned_response = cleaned_response[:-3]
-            
-            cleaned_response = cleaned_response.strip()
-            
-            # Parse JSON
-            invoice_data = json.loads(cleaned_response)
+            # Ya no necesitamos limpiar markdown - Gemini garantiza JSON puro
+            invoice_data = json.loads(response_text.strip())
             
             # Add metadata
             invoice_data["source_file"] = filename
