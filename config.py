@@ -5,20 +5,20 @@ import os
 class Settings(BaseSettings):
     # API Configuration
     app_name: str = "WhatsApp Invoice Extraction API"
-    debug: bool = False
+    debug: bool = os.getenv("DEBUG", "false").lower() == "true"
     
     # File Processing
-    max_file_size_mb: int = 300
+    max_file_size_mb: int = int(os.getenv("MAX_FILE_SIZE_MB", "300"))
     allowed_extensions: List[str] = [".txt", ".jpg", ".png", ".jpeg", ".pdf"]
     temp_dir: str = "/tmp/invoice_processing"
     
     # Vertex AI Configuration
     google_cloud_project: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
     google_application_credentials: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-    gemini_model: str = "gemini-2.5-flash-lite"
-    gemini_location: str = "us-central1"
-    gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "2"))  # Reducido de 5 a 2
-    gemini_timeout_seconds: int = 30
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    gemini_location: str = os.getenv("GEMINI_LOCATION", "us-central1")
+    gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "1"))
+    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "90"))  # Aumentado de 30 a 90s
     
     # Processing Configuration
     max_files_per_batch: int = 100

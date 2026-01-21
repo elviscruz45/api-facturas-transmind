@@ -21,8 +21,8 @@ docker-compose down
 ### Test locally
 
 ```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/api/v1/info
+curl http://localhost:8080/health
+curl http://localhost:8080/api/v1/info
 ```
 
 ## Deploy to Google Cloud Run
@@ -189,7 +189,7 @@ gcloud run services describe api-facturas --region us-central1
 
 ```bash
 docker build -t api-facturas:test .
-docker run -p 8080:8000 \
+docker run -p 8080:8080 \
   -e GOOGLE_CLOUD_PROJECT=facturacion-484614 \
   api-facturas:test
 ```

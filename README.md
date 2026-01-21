@@ -52,7 +52,7 @@ poetry run start
 
 # Or activate virtual environment and run manually
 poetry shell
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8080
 ```
 
 ## Testing with Insomnia
@@ -60,19 +60,19 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ### 1. Health Check
 
 ```
-GET http://localhost:8000/health
+GET http://localhost:8080/health
 ```
 
 ### 2. Service Info
 
 ```
-GET http://localhost:8000/api/v1/info
+GET http://localhost:8080/api/v1/info
 ```
 
 ### 3. Process ZIP File
 
 ```
-POST http://localhost:8000/api/v1/process-zip
+POST http://localhost:8080/api/v1/process-zip
 Content-Type: multipart/form-data
 
 Body:
@@ -185,4 +185,5 @@ The application provides structured logging for debugging:
 - Advanced monitoring and metrics
 - Docker containerization
 - CI/CD pipeline
+
 # api-facturas-transmind

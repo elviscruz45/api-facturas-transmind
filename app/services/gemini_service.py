@@ -119,6 +119,9 @@ Rules:
                     timeout=self.timeout_seconds
                 )
                 
+                # Delay entre requests para respetar rate limit (2s = ~30 RPM)
+                await asyncio.sleep(2)
+                
                 # Parse response
                 return self._parse_gemini_response(response, filename, sequence_id)
                 
@@ -173,6 +176,9 @@ Rules:
                     timeout=self.timeout_seconds
                 )
                 
+                # Delay entre requests para respetar rate limit (2s = ~30 RPM)
+                await asyncio.sleep(2)
+                
                 return self._parse_gemini_response(response, filename, sequence_id)
                 
             except Exception as e:
@@ -188,8 +194,8 @@ Rules:
     
     async def _call_gemini_async(self, image_part: Part, prompt: str) -> str:
         """Make async call to Gemini with image and automatic retries for rate limits"""
-        max_retries = 3
-        base_delay = 2  # seconds
+        max_retries = 5
+        base_delay = 3  # Reducido de 5 a 3 para evitar timeout (3s, 6s, 12s, 24s)
         
         for attempt in range(max_retries):
             try:
@@ -230,8 +236,8 @@ Rules:
     
     async def _call_gemini_text_async(self, prompt: str) -> str:
         """Make async call to Gemini with text only and automatic retries"""
-        max_retries = 3
-        base_delay = 2  # seconds
+        max_retries = 5
+        base_delay = 3  # Reducido de 5 a 3 para evitar timeout (3s, 6s, 12s, 24s)
         
         for attempt in range(max_retries):
             try:
