@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     google_cloud_project: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
     google_application_credentials: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    gemini_location: str = os.getenv("GEMINI_LOCATION", "us-central1")
+    gemini_location: str = os.getenv("GEMINI_LOCATION", "us-east4")
     gemini_concurrency_limit: int = int(os.getenv("GEMINI_CONCURRENCY_LIMIT", "1"))
-    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "90"))  # Aumentado de 30 a 90s
+    gemini_timeout_seconds: int = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "180"))  # Aumentado a 180s para horas pico
     
     # Processing Configuration
     max_files_per_batch: int = 100
