@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     supabase_secret_key: str = os.getenv("SUPABASE_SECRET_KEY", "")
     database_url: str = os.getenv("DATABASE_URL", "")
     
+    # Telegram Bot Configuration
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    
     # Processing Configuration
     max_files_per_batch: int = 100
     encoding_fallback_sequence: List[str] = ["utf-8", "latin-1", "cp1252"]
