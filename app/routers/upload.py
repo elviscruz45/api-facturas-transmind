@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from app.services.zip_handler import ZipHandler
 from app.services.processing_orchestrator import orchestrator
 from app.services.storage_service import storage_service
+from app.services.supabase_service import supabase_service
 from app.schemas.invoice_schema import ProcessingResponse
 from app.utils.logger import setup_logger
 import io
@@ -243,6 +244,45 @@ async def process_zip_file(file: UploadFile = File(...)):
             file.filename,
             company_id=None  # TODO: extraer de headers o auth
         )
+        
+        # Save to Supabase database
+        record_id = None
+        if supabase_service.is_enabled():
+            try:
+                # 1. Save processing record
+                record_id = await supabase_service.save_processing_record(
+                    company_id=None,  # TODO: extraer de headers/auth cuando implementes multi-tenancy
+                    zip_filename=file.filename,
+                    zip_blob_path=storage_metadata["blob_path"] if storage_metadata else None,
+                    excel_blob_path=excel_metadata["blob_path"] if excel_metadata else None,
+                    total_invoices=processing_response.total_processed,
+                    success_count=processing_response.success_count,
+                    error_count=len(processing_response.errors)
+                )
+                
+                # 2. Save invoices to database
+                if record_id and processing_response.results:
+                    await supabase_service.save_invoices_batch(
+                        invoices=processing_response.results,
+                        company_id=None,  # TODO: extraer de headers/auth
+                        record_id=record_id
+                    )
+                
+                logger.log_info(
+                    "Data saved to Supabase",
+                    record_id=record_id,
+                    invoices_count=len(processing_response.results)
+                )
+                
+            except Exception as db_error:
+                # Database errors don't fail the request (graceful degradation)
+                logger.log_error(
+                    "Failed to save to Supabase (continuing with Excel response)",
+                    error=str(db_error),
+                    filename=file.filename
+                )
+        else:
+            logger.log_info("Supabase integration disabled, skipping database save")
         
         # Generate filename with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

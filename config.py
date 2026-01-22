@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     storage_result_folder: str = "results"
     storage_retention_days: int = 90
     
+    # Supabase Configuration
+    supabase_url: str = os.getenv("SUPABASE_URL", "")
+    supabase_publishable_key: str = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+    supabase_secret_key: str = os.getenv("SUPABASE_SECRET_KEY", "")
+    database_url: str = os.getenv("DATABASE_URL", "")
     
     # Processing Configuration
     max_files_per_batch: int = 100
