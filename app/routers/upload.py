@@ -251,20 +251,19 @@ async def process_zip_file(file: UploadFile = File(...)):
             try:
                 # 1. Save processing record
                 record_id = await supabase_service.save_processing_record(
-                    company_id=None,  # TODO: extraer de headers/auth cuando implementes multi-tenancy
-                    zip_filename=file.filename,
+                    chat_id="anonymous",  # TODO: extraer de headers/auth cuando implementes multi-tenancy
                     zip_blob_path=storage_metadata["blob_path"] if storage_metadata else None,
                     excel_blob_path=excel_metadata["blob_path"] if excel_metadata else None,
-                    total_invoices=processing_response.total_processed,
-                    success_count=processing_response.success_count,
-                    error_count=len(processing_response.errors)
+                    total_files=processing_response.total_processed,
+                    success_files=processing_response.success_count,
+                    error_files=len(processing_response.errors)
                 )
                 
                 # 2. Save invoices to database
                 if record_id and processing_response.results:
                     await supabase_service.save_invoices_batch(
                         invoices=processing_response.results,
-                        company_id=None,  # TODO: extraer de headers/auth
+                        chat_id="anonymous",  # TODO: extraer de headers/auth
                         record_id=record_id
                     )
                 
