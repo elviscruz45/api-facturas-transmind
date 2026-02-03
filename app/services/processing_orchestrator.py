@@ -52,30 +52,7 @@ class ProcessingOrchestrator:
                 try:
                     result = await self.process_single_file(file_record)
                     
-                    # Manejar PDFs multi-página (retorna múltiples facturas)
-                    if result.get("processing_type") == "multi_page_pdf":
-                        page_results = result.get("page_results", [])
-                        
-                        for page_result in page_results:
-                            if page_result["success"]:
-                                results.append(page_result["invoice_data"])
-                            else:
-                                errors.append({
-                                    "file": page_result.get("invoice_data", {}).get("source_file", file_record.filename),
-                                    "sequence_id": page_result.get("invoice_data", {}).get("sequence_id", file_record.sequence_id),
-                                    "file_type": file_record.file_type,
-                                    "error": page_result.get("error", "Unknown error")
-                                })
-                        
-                        logger.log_info(
-                            f"Multi-page PDF processed",
-                            filename=file_record.filename,
-                            total_pages=result.get("total_pages"),
-                            successful_pages=sum(1 for r in page_results if r["success"])
-                        )
-                    
-                    # Manejar archivos individuales (imagen, texto, PDF 1 página)
-                    elif result["success"]:
+                    if result["success"]:
                         results.append(result["invoice_data"])
                         logger.log_file_processing(
                             filename=file_record.filename,
@@ -248,7 +225,7 @@ class ProcessingOrchestrator:
             }
     
     async def process_pdf_file(self, file_record: FileRecord) -> Dict:
-        """Process PDF file - cada página se procesa como factura separada"""
+        """Process PDF file"""
         try:
             # Process PDF (detect text vs scanned)
             pdf_result = self.pdf_processor.process_pdf_file(file_record.file_path)
@@ -257,39 +234,12 @@ class ProcessingOrchestrator:
                 return pdf_result
             
             if pdf_result["processing_type"] == "text_extraction":
-                # Text-based PDF con múltiples páginas
-                pages = pdf_result["pages"]
-                total_pages = pdf_result["total_pages"]
-                
-                logger.log_info(
-                    f"Processing PDF with {total_pages} pages",
-                    filename=file_record.filename,
-                    total_pages=total_pages
+                # Text-based PDF - send text to Gemini
+                text_content = pdf_result["content"]
+                gemini_result = await gemini_service.extract_invoice_from_text(
+                    text_content, file_record.filename, file_record.sequence_id
                 )
-                
-                # Procesar cada página como factura individual
-                page_results = []
-                for page_num, page_text in enumerate(pages, start=1):
-                    # Crear filename único por página
-                    page_filename = f"{file_record.filename}_page{page_num}"
-                    
-                    # Procesar página con Gemini
-                    gemini_result = await gemini_service.extract_invoice_from_text(
-                        page_text, 
-                        page_filename, 
-                        file_record.sequence_id + (page_num - 1) * 0.1  # Sub-sequence
-                    )
-                    
-                    page_results.append(gemini_result)
-                
-                # Retornar resultado consolidado
-                return {
-                    "success": True,
-                    "processing_type": "multi_page_pdf",
-                    "total_pages": total_pages,
-                    "page_results": page_results,
-                    "source_file": file_record.filename
-                }
+                return gemini_result
             
             else:
                 return {

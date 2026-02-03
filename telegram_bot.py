@@ -196,6 +196,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "user": update.effective_user.username or str(update.effective_user.id)
         }
         
+        logger.log_info(
+            "Photo stored in pending_files",
+            callback_key=callback_key,
+            total_pending=len(pending_files),
+            pending_keys=list(pending_files.keys())
+        )
+        
         # Create confirmation buttons
         keyboard = [
             [
@@ -259,6 +266,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "user": update.effective_user.username or str(update.effective_user.id)
         }
         
+        logger.log_info(
+            "PDF stored in pending_files",
+            callback_key=callback_key,
+            file_name=file_name,
+            total_pending=len(pending_files),
+            pending_keys=list(pending_files.keys())
+        )
+        
         # Create confirmation buttons
         keyboard = [
             [
@@ -298,6 +313,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     callback_data = query.data
     
+    # Log callback received
+    logger.log_info(
+        "Callback received",
+        callback_data=callback_data,
+        pending_files_keys=list(pending_files.keys())
+    )
+    
     # Parse callback: "yes_chatid_msgid" or "no_chatid_msgid"
     parts = callback_data.split("_", 1)
     if len(parts) != 2:
@@ -306,10 +328,27 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     action, callback_key = parts
     
+    # Log parsed data
+    logger.log_info(
+        "Callback parsed",
+        action=action,
+        callback_key=callback_key,
+        exists=callback_key in pending_files
+    )
+    
     # Get pending file info
     file_info = pending_files.get(callback_key)
     if not file_info:
-        await query.edit_message_text("⚠️ Archivo expirado. Por favor, envía la factura nuevamente.")
+        await query.edit_message_text(
+            f"⚠️ Archivo expirado o bot reiniciado.\n\n"
+            f"Por favor, envía la factura nuevamente.\n\n"
+            f"💡 Tip: Procesa la factura inmediatamente después de enviarla."
+        )
+        logger.log_warning(
+            "Pending file not found",
+            callback_key=callback_key,
+            available_keys=list(pending_files.keys())
+        )
         return
     
     if action == "no":
@@ -346,14 +385,22 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     sequence_id=1
                 )
             else:
-                # Process as PDF (for MVP, treat as image for now)
-                # TODO: Implement proper PDF processing
-                await query.edit_message_text(
-                    "⚠️ Procesamiento de PDF aún no implementado en MVP.\n\n"
-                    "Por favor, envía una captura de pantalla de la factura como foto."
+                # Process as PDF
+                logger.log_info("Processing PDF file", callback_key=callback_key)
+                
+                # Download PDF file
+                file = await context.bot.get_file(file_id)
+                file_bytes = await file.download_as_bytearray()
+                
+                # Convert to base64
+                pdf_base64 = base64.b64encode(bytes(file_bytes)).decode('utf-8')
+                
+                # Process with Gemini
+                result = await gemini_service.extract_invoice_from_pdf(
+                    pdf_base64=pdf_base64,
+                    filename=file_info.get("file_name", f"telegram_pdf_{file_id}.pdf"),
+                    sequence_id=1
                 )
-                del pending_files[callback_key]
-                return
             
             # Check if extraction was successful
             if not result or not result.get("success"):
@@ -480,37 +527,859 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Remove from pending
             if callback_key in pending_files:
                 del pending_files[callback_key]
+    
+    # Handle delete callbacks
+    elif callback_data.startswith("delete_"):
+        chat_id = str(update.effective_chat.id)
+        
+        if callback_data == "delete_cancel":
+            await query.edit_message_text("❌ Operación cancelada")
+            return
+        
+        # Extract invoice_id
+        invoice_id = callback_data.replace("delete_", "")
+        
+        # Confirm deletion
+        keyboard = [
+            [
+                InlineKeyboardButton("⚠️ Sí, eliminar", callback_data=f"confirm_delete_{invoice_id}"),
+                InlineKeyboardButton("❌ No, cancelar", callback_data="delete_cancel")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "⚠️ **¿Estás seguro?**\n\n"
+            "Esta factura será **eliminada permanentemente** de la base de datos.\n"
+            "❗ Esta acción NO se puede deshacer.",
+            reply_markup=reply_markup
+        )
+    
+    elif callback_data.startswith("confirm_delete_"):
+        chat_id = str(update.effective_chat.id)
+        invoice_id = callback_data.replace("confirm_delete_", "")
+        
+        try:
+            if not supabase_service.is_enabled():
+                await query.edit_message_text("❌ Servicio de base de datos no disponible.")
+                return
+            
+            # Delete invoice items first (due to foreign key)
+            supabase_service.client.table("invoice_items").delete().eq(
+                "invoice_id", invoice_id
+            ).eq("company_id", chat_id).execute()
+            
+            # Delete invoice (hard delete)
+            result = supabase_service.client.table("invoices").delete().eq(
+                "id", invoice_id
+            ).eq("company_id", chat_id).execute()
+            
+            if result.data:
+                await query.edit_message_text("✅ Factura eliminada permanentemente de la base de datos")
+                logger.log_info("Invoice permanently deleted", chat_id=chat_id, invoice_id=invoice_id)
+            else:
+                await query.edit_message_text("❌ No se pudo eliminar la factura")
+        
+        except Exception as e:
+            logger.log_error("Error deleting invoice", error=str(e), chat_id=chat_id)
+            await query.edit_message_text(f"❌ Error: {str(e)}")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /ayuda command"""
     help_text = """
-📖 **Ayuda - Bot de Facturas**
+📖 **AYUDA - Bot de Facturas para PYMEs**
 
-**Cómo usar:**
-1. Envía una foto clara de tu factura
-2. Espera la confirmación
-3. Haz clic en "✅ Sí, procesar"
-4. Recibe tu Excel con los datos
+**📸 PROCESAR FACTURAS:**
+1. Envía una foto clara de tu factura o un PDF
+2. Confirma con ✅ Sí
+3. Recibe Excel con los datos extraídos
 
 **Formatos aceptados:**
-• Fotos (JPG, PNG)
-• PDFs (próximamente)
+• 📸 Fotos (JPG, PNG)
+• 📄 PDFs
 
-**Consejos para mejores resultados:**
-• Asegúrate de que la factura esté completa
-• Buena iluminación
-• Imagen clara y enfocada
-• Evita sombras y reflejos
+**💰 CONSULTAS DE GASTOS:**
 
-**Comandos:**
-/start - Iniciar el bot
-/ayuda - Ver esta ayuda
+`/resumen DD-MM-YYYY DD-MM-YYYY`
+Resumen de gastos en un periodo
+Ejemplo: `/resumen 01-01-2026 31-01-2026`
+📊 Total gastado, cantidad de facturas, Excel del periodo
 
-¿Necesitas soporte? Contacta al administrador.
+`/proveedores [mes]` o `/proveedores [inicio] [fin]`
+Top 10 proveedores por gasto
+Ejemplo: `/proveedores 01-2026`
+🏪 Dónde gastas más, útil para negociar
+
+`/estadisticas [mes]`
+Dashboard de estadísticas del mes
+Ejemplo: `/estadisticas 01-2026`
+📈 Promedio, día con más gastos, top proveedores
+
+`/comparar [mes1] [mes2]`
+Compara gastos entre dos meses
+Ejemplo: `/comparar 01-2026 12-2025`
+📊 % de aumento/reducción de gastos
+
+**🔍 BUSCAR FACTURAS:**
+
+`/buscar [término]`
+Buscar por número, proveedor, RUC o monto
+Ejemplo: `/buscar F001-12345` o `/buscar Sodimac`
+
+`/items [producto]` o `/items [mes]`
+Buscar productos y ver precios históricos
+Ejemplo: `/items laptop` o `/items 01-2026`
+💻 Detecta si te cobran más caro
+
+`/historial [cantidad]`
+Ver últimas N facturas procesadas
+Ejemplo: `/historial 10`
+📄 Con botones para descargar Excel
+
+**🗑️ GESTIÓN:**
+
+`/eliminar`
+Ver últimas facturas y eliminar errores
+Pide confirmación antes de borrar
+
+**⚙️ OTROS:**
+
+`/start` - Registrar tu empresa
+`/ayuda` - Ver esta ayuda
+
+**💡 Consejos:**
+• Foto clara, buena iluminación
+• Factura completa visible
+• PDFs directamente desde el emisor
+• Evita sombras y reflejos en fotos
 """
     
     await update.message.reply_text(help_text)
+
+
+async def resumen_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /resumen [fecha_inicio] [fecha_fin]"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        # Parse dates from command
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ Formato incorrecto.\n\n"
+                "Uso: `/resumen DD-MM-YYYY DD-MM-YYYY`\n"
+                "Ejemplo: `/resumen 01-01-2026 31-01-2026`"
+            )
+            return
+        
+        fecha_inicio_str = context.args[0]
+        fecha_fin_str = context.args[1]
+        
+        try:
+            fecha_inicio = datetime.strptime(fecha_inicio_str, "%d-%m-%Y").date()
+            fecha_fin = datetime.strptime(fecha_fin_str, "%d-%m-%Y").date()
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Formato de fecha inválido.\n\n"
+                "Usa: DD-MM-YYYY\n"
+                "Ejemplo: `/resumen 01-01-2026 31-01-2026`"
+            )
+            return
+        
+        if fecha_inicio > fecha_fin:
+            await update.message.reply_text("❌ La fecha de inicio debe ser anterior a la fecha de fin.")
+            return
+        
+        # Get invoices from Supabase
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        await update.message.reply_text("⏳ Consultando facturas...")
+        
+        # Query invoices in date range
+        result = supabase_service.client.table("invoices").select("*").eq(
+            "company_id", chat_id
+        ).gte("invoice_date", str(fecha_inicio)).lte("invoice_date", str(fecha_fin)).is_(
+            "deleted_at", "null"
+        ).execute()
+        
+        invoices = result.data if result.data else []
+        
+        if not invoices:
+            await update.message.reply_text(
+                f"📭 No hay facturas entre {fecha_inicio_str} y {fecha_fin_str}"
+            )
+            return
+        
+        # Calculate totals
+        total_subtotal = sum(float(inv.get("subtotal", 0) or 0) for inv in invoices)
+        total_igv = sum(float(inv.get("igv", 0) or 0) for inv in invoices)
+        total_general = sum(float(inv.get("total", 0) or 0) for inv in invoices)
+        cantidad = len(invoices)
+        promedio = total_general / cantidad if cantidad > 0 else 0
+        currency = invoices[0].get("currency", "PEN") if invoices else "PEN"
+        
+        # Generate Excel with all invoices
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Resumen"
+        
+        # Header
+        headers = ["Fecha", "Nro. Factura", "Proveedor", "RUC", "Subtotal", "IGV", "Total", "Moneda"]
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+            cell.font = Font(color="FFFFFF", bold=True)
+        
+        # Data rows
+        for row_idx, inv in enumerate(invoices, 2):
+            ws.cell(row=row_idx, column=1, value=inv.get("invoice_date", ""))
+            ws.cell(row=row_idx, column=2, value=inv.get("invoice_number", ""))
+            ws.cell(row=row_idx, column=3, value=inv.get("supplier_name", ""))
+            ws.cell(row=row_idx, column=4, value=inv.get("supplier_ruc", ""))
+            ws.cell(row=row_idx, column=5, value=float(inv.get("subtotal", 0) or 0))
+            ws.cell(row=row_idx, column=6, value=float(inv.get("igv", 0) or 0))
+            ws.cell(row=row_idx, column=7, value=float(inv.get("total", 0) or 0))
+            ws.cell(row=row_idx, column=8, value=inv.get("currency", "PEN"))
+        
+        # Totals row
+        total_row = len(invoices) + 2
+        ws.cell(row=total_row, column=4, value="TOTAL:").font = Font(bold=True)
+        ws.cell(row=total_row, column=5, value=total_subtotal).font = Font(bold=True)
+        ws.cell(row=total_row, column=6, value=total_igv).font = Font(bold=True)
+        ws.cell(row=total_row, column=7, value=total_general).font = Font(bold=True)
+        
+        # Auto-adjust columns
+        for col in range(1, 9):
+            ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 15
+        
+        excel_file = io.BytesIO()
+        wb.save(excel_file)
+        excel_file.seek(0)
+        
+        # Send summary message
+        summary = (
+            f"📊 **Resumen de Gastos**\n"
+            f"📅 Periodo: {fecha_inicio_str} - {fecha_fin_str}\n\n"
+            f"💰 **Total:** {currency} {total_general:,.2f}\n"
+            f"📄 Subtotal: {currency} {total_subtotal:,.2f}\n"
+            f"💵 IGV: {currency} {total_igv:,.2f}\n\n"
+            f"📋 **Facturas:** {cantidad}\n"
+            f"📈 **Promedio:** {currency} {promedio:,.2f}\n"
+        )
+        
+        await update.message.reply_text(summary)
+        
+        # Send Excel
+        filename = f"resumen_{fecha_inicio_str}_{fecha_fin_str}.xlsx"
+        await update.message.reply_document(
+            document=excel_file,
+            filename=filename,
+            caption="📎 Resumen detallado en Excel"
+        )
+        
+        logger.log_info(
+            "Resumen generated",
+            chat_id=chat_id,
+            fecha_inicio=str(fecha_inicio),
+            fecha_fin=str(fecha_fin),
+            total=total_general,
+            cantidad=cantidad
+        )
+        
+    except Exception as e:
+        logger.log_error("Error in resumen_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error al generar resumen: {str(e)}")
+
+
+async def proveedores_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /proveedores [mes] or /proveedores [inicio] [fin]"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        # Parse period
+        if len(context.args) == 0:
+            # Current month
+            now = datetime.now()
+            fecha_inicio = datetime(now.year, now.month, 1).date()
+            if now.month == 12:
+                fecha_fin = datetime(now.year + 1, 1, 1).date()
+            else:
+                fecha_fin = datetime(now.year, now.month + 1, 1).date()
+            periodo_str = f"{now.month:02d}-{now.year}"
+        elif len(context.args) == 1:
+            # MM-YYYY format
+            try:
+                month, year = context.args[0].split("-")
+                month, year = int(month), int(year)
+                fecha_inicio = datetime(year, month, 1).date()
+                if month == 12:
+                    fecha_fin = datetime(year + 1, 1, 1).date()
+                else:
+                    fecha_fin = datetime(year, month + 1, 1).date()
+                periodo_str = f"{month:02d}-{year}"
+            except:
+                await update.message.reply_text(
+                    "❌ Formato incorrecto.\n\n"
+                    "Uso: `/proveedores MM-YYYY`\n"
+                    "Ejemplo: `/proveedores 01-2026`"
+                )
+                return
+        else:
+            # Two dates
+            try:
+                fecha_inicio = datetime.strptime(context.args[0], "%d-%m-%Y").date()
+                fecha_fin = datetime.strptime(context.args[1], "%d-%m-%Y").date()
+                periodo_str = f"{context.args[0]} - {context.args[1]}"
+            except:
+                await update.message.reply_text(
+                    "❌ Formato de fecha inválido.\n\n"
+                    "Usa: DD-MM-YYYY"
+                )
+                return
+        
+        await update.message.reply_text("⏳ Analizando proveedores...")
+        
+        # Query invoices
+        result = supabase_service.client.table("invoices").select("*").eq(
+            "company_id", chat_id
+        ).gte("invoice_date", str(fecha_inicio)).lt("invoice_date", str(fecha_fin)).is_(
+            "deleted_at", "null"
+        ).execute()
+        
+        invoices = result.data if result.data else []
+        
+        if not invoices:
+            await update.message.reply_text(f"📭 No hay facturas en {periodo_str}")
+            return
+        
+        # Group by supplier
+        from collections import defaultdict
+        suppliers = defaultdict(lambda: {"total": 0, "count": 0, "ruc": ""})
+        
+        for inv in invoices:
+            supplier = inv.get("supplier_name", "Sin nombre")
+            total = float(inv.get("total", 0) or 0)
+            ruc = inv.get("supplier_ruc", "")
+            
+            suppliers[supplier]["total"] += total
+            suppliers[supplier]["count"] += 1
+            if ruc and not suppliers[supplier]["ruc"]:
+                suppliers[supplier]["ruc"] = ruc
+        
+        # Sort by total descending
+        sorted_suppliers = sorted(suppliers.items(), key=lambda x: x[1]["total"], reverse=True)
+        top_10 = sorted_suppliers[:10]
+        
+        currency = invoices[0].get("currency", "PEN") if invoices else "PEN"
+        total_general = sum(s[1]["total"] for s in sorted_suppliers)
+        
+        # Generate message
+        message = f"🏪 **Top Proveedores {periodo_str}**\n\n"
+        
+        for idx, (name, data) in enumerate(top_10, 1):
+            percentage = (data["total"] / total_general * 100) if total_general > 0 else 0
+            message += f"{idx}. **{name}**\n"
+            message += f"   💰 {currency} {data['total']:,.2f} ({percentage:.1f}%)\n"
+            message += f"   📄 {data['count']} factura(s)\n"
+            if data["ruc"]:
+                message += f"   🆔 RUC: {data['ruc']}\n"
+            message += "\n"
+        
+        message += f"💰 **Total periodo:** {currency} {total_general:,.2f}"
+        
+        await update.message.reply_text(message)
+        
+        logger.log_info(
+            "Proveedores analyzed",
+            chat_id=chat_id,
+            periodo=periodo_str,
+            total_suppliers=len(suppliers)
+        )
+        
+    except Exception as e:
+        logger.log_error("Error in proveedores_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def items_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /items [termino] or /items [mes]"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        if len(context.args) == 0:
+            await update.message.reply_text(
+                "❌ Debes especificar un término de búsqueda o periodo.\n\n"
+                "Ejemplos:\n"
+                "`/items laptop`\n"
+                "`/items 01-2026`"
+            )
+            return
+        
+        search_term = " ".join(context.args)
+        
+        await update.message.reply_text(f"🔍 Buscando items con '{search_term}'...")
+        
+        # Query invoice_items table
+        result = supabase_service.client.table("invoice_items").select(
+            "*, invoices!inner(invoice_date, invoice_number, supplier_name, company_id)"
+        ).eq("invoices.company_id", chat_id).ilike(
+            "description", f"%{search_term}%"
+        ).order("invoices.invoice_date", desc=True).limit(50).execute()
+        
+        items = result.data if result.data else []
+        
+        if not items:
+            await update.message.reply_text(f"📭 No se encontraron items con '{search_term}'")
+            return
+        
+        # Format response
+        message = f"💼 **Items encontrados:** {len(items)}\n"
+        message += f"🔍 Búsqueda: '{search_term}'\n\n"
+        
+        total_spent = 0
+        for idx, item in enumerate(items[:20], 1):  # Show first 20
+            invoice = item.get("invoices", {})
+            date = invoice.get("invoice_date", "")
+            inv_num = invoice.get("invoice_number", "")
+            supplier = invoice.get("supplier_name", "")
+            desc = item.get("description", "")
+            qty = item.get("quantity", 0) or 0
+            unit_price = item.get("unit_price", 0) or 0
+            total_price = item.get("total_price", 0) or 0
+            
+            total_spent += float(total_price)
+            
+            message += f"{idx}. **{desc[:40]}**\n"
+            message += f"   📅 {date} | {inv_num}\n"
+            message += f"   🏪 {supplier}\n"
+            message += f"   📦 Cant: {qty} x S/ {unit_price:.2f} = S/ {total_price:.2f}\n\n"
+            
+            if idx >= 10:  # Limit to avoid too long messages
+                break
+        
+        if len(items) > 20:
+            message += f"_(Mostrando 20 de {len(items)} resultados)_\n\n"
+        
+        message += f"💰 **Total gastado:** S/ {total_spent:,.2f}"
+        
+        await update.message.reply_text(message)
+        
+        logger.log_info(
+            "Items searched",
+            chat_id=chat_id,
+            search_term=search_term,
+            results=len(items)
+        )
+        
+    except Exception as e:
+        logger.log_error("Error in items_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def buscar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /buscar [termino]"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        if len(context.args) == 0:
+            await update.message.reply_text(
+                "❌ Debes especificar un término de búsqueda.\n\n"
+                "Ejemplos:\n"
+                "`/buscar F001-12345`\n"
+                "`/buscar Sodimac`\n"
+                "`/buscar 20123456789`"
+            )
+            return
+        
+        search_term = " ".join(context.args)
+        
+        await update.message.reply_text(f"🔍 Buscando '{search_term}'...")
+        
+        # Search in multiple fields
+        result = supabase_service.client.table("invoices").select("*").eq(
+            "company_id", chat_id
+        ).is_("deleted_at", "null").or_(
+            f"invoice_number.ilike.%{search_term}%,"
+            f"supplier_name.ilike.%{search_term}%,"
+            f"supplier_ruc.ilike.%{search_term}%,"
+            f"customer_name.ilike.%{search_term}%"
+        ).order("invoice_date", desc=True).limit(20).execute()
+        
+        invoices = result.data if result.data else []
+        
+        if not invoices:
+            await update.message.reply_text(f"📭 No se encontraron facturas con '{search_term}'")
+            return
+        
+        # Format response
+        message = f"📄 **Facturas encontradas:** {len(invoices)}\n"
+        message += f"🔍 Búsqueda: '{search_term}'\n\n"
+        
+        for idx, inv in enumerate(invoices[:10], 1):
+            date = inv.get("invoice_date", "")
+            num = inv.get("invoice_number", "")
+            supplier = inv.get("supplier_name", "")
+            total = float(inv.get("total", 0) or 0)
+            currency = inv.get("currency", "PEN")
+            
+            message += f"{idx}. **{num or 'Sin número'}**\n"
+            message += f"   📅 {date}\n"
+            message += f"   🏪 {supplier}\n"
+            message += f"   💰 {currency} {total:,.2f}\n\n"
+        
+        if len(invoices) > 10:
+            message += f"_(Mostrando 10 de {len(invoices)} resultados)_"
+        
+        await update.message.reply_text(message)
+        
+        logger.log_info(
+            "Invoices searched",
+            chat_id=chat_id,
+            search_term=search_term,
+            results=len(invoices)
+        )
+        
+    except Exception as e:
+        logger.log_error("Error in buscar_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def historial_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /historial [cantidad]"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        # Parse limit
+        limit = 10
+        if len(context.args) > 0:
+            try:
+                limit = int(context.args[0])
+                if limit < 1 or limit > 50:
+                    limit = 10
+            except:
+                limit = 10
+        
+        await update.message.reply_text(f"📚 Consultando últimas {limit} facturas...")
+        
+        # Query recent invoices
+        result = supabase_service.client.table("invoices").select("*").eq(
+            "company_id", chat_id
+        ).is_("deleted_at", "null").order("created_at", desc=True).limit(limit).execute()
+        
+        invoices = result.data if result.data else []
+        
+        if not invoices:
+            await update.message.reply_text("📭 No hay facturas registradas")
+            return
+        
+        # Format response
+        message = f"📚 **Últimas {len(invoices)} facturas**\n\n"
+        
+        for idx, inv in enumerate(invoices, 1):
+            date = inv.get("invoice_date", "Sin fecha")
+            num = inv.get("invoice_number", "Sin número")
+            supplier = inv.get("supplier_name", "Sin proveedor")
+            total = float(inv.get("total", 0) or 0)
+            currency = inv.get("currency", "PEN")
+            
+            message += f"{idx}. **{num}**\n"
+            message += f"   📅 {date} | 🏪 {supplier}\n"
+            message += f"   💰 {currency} {total:,.2f}\n\n"
+        
+        await update.message.reply_text(message)
+        
+        logger.log_info(
+            "Historial displayed",
+            chat_id=chat_id,
+            limit=limit,
+            results=len(invoices)
+        )
+        
+    except Exception as e:
+        logger.log_error("Error in historial_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def eliminar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /eliminar - show recent invoices with delete buttons"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        # Query recent invoices
+        result = supabase_service.client.table("invoices").select("id, invoice_number, invoice_date, supplier_name, total, currency, created_at").eq(
+            "company_id", chat_id
+        ).is_("deleted_at", "null").order("created_at", desc=True).limit(5).execute()
+        
+        invoices = result.data if result.data else []
+        
+        if not invoices:
+            await update.message.reply_text("📭 No hay facturas para eliminar")
+            return
+        
+        # Create buttons for each invoice
+        keyboard = []
+        for inv in invoices:
+            inv_id = inv.get("id")
+            num = inv.get("invoice_number", "Sin número")
+            date = inv.get("invoice_date", "")
+            supplier = inv.get("supplier_name", "")[:10]
+            total = float(inv.get("total", 0) or 0)
+            created_at = inv.get("created_at", "")
+            
+            # Format created_at to show date and time
+            if created_at:
+                try:
+                    dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                    fecha_subida = dt.strftime("%d/%m %H:%M")
+                except:
+                    fecha_subida = ""
+            else:
+                fecha_subida = ""
+            
+            button_text = f"🗑️ {num} - {supplier} - S/ {total:.0f} - 📅 {fecha_subida}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"delete_{inv_id}")])
+        
+        keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="delete_cancel")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🗑️ **Selecciona factura a eliminar:**\n\n"
+            "⚠️ La factura será eliminada permanentemente de la base de datos.",
+            reply_markup=reply_markup
+        )
+        
+        logger.log_info("Delete menu shown", chat_id=chat_id, invoices_count=len(invoices))
+        
+    except Exception as e:
+        logger.log_error("Error in eliminar_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def estadisticas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /estadisticas [mes]"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        from collections import defaultdict
+        
+        # Parse period
+        if len(context.args) == 0:
+            now = datetime.now()
+            month, year = now.month, now.year
+        else:
+            try:
+                month, year = context.args[0].split("-")
+                month, year = int(month), int(year)
+            except:
+                await update.message.reply_text(
+                    "❌ Formato incorrecto. Usa: `/estadisticas MM-YYYY`\n"
+                    "Ejemplo: `/estadisticas 01-2026`"
+                )
+                return
+        
+        fecha_inicio = datetime(year, month, 1).date()
+        if month == 12:
+            fecha_fin = datetime(year + 1, 1, 1).date()
+        else:
+            fecha_fin = datetime(year, month + 1, 1).date()
+        
+        await update.message.reply_text("📊 Generando estadísticas...")
+        
+        # Query invoices
+        result = supabase_service.client.table("invoices").select("*").eq(
+            "company_id", chat_id
+        ).gte("invoice_date", str(fecha_inicio)).lt("invoice_date", str(fecha_fin)).is_(
+            "deleted_at", "null"
+        ).execute()
+        
+        invoices = result.data if result.data else []
+        
+        if not invoices:
+            await update.message.reply_text(f"📭 No hay facturas en {month:02d}-{year}")
+            return
+        
+        # Calculate statistics
+        total = sum(float(inv.get("total", 0) or 0) for inv in invoices)
+        cantidad = len(invoices)
+        promedio = total / cantidad if cantidad > 0 else 0
+        currency = invoices[0].get("currency", "PEN") if invoices else "PEN"
+        
+        # Group by day
+        by_day = defaultdict(float)
+        for inv in invoices:
+            date = inv.get("invoice_date", "")
+            if date:
+                by_day[date] += float(inv.get("total", 0) or 0)
+        
+        max_day = max(by_day.items(), key=lambda x: x[1]) if by_day else (None, 0)
+        
+        # Top suppliers
+        suppliers = defaultdict(float)
+        for inv in invoices:
+            supplier = inv.get("supplier_name", "Sin nombre")
+            suppliers[supplier] += float(inv.get("total", 0) or 0)
+        
+        top_3 = sorted(suppliers.items(), key=lambda x: x[1], reverse=True)[:3]
+        
+        # Format message
+        message = f"📊 **Estadísticas {month:02d}/{year}**\n\n"
+        message += f"💰 **Total gastado:** {currency} {total:,.2f}\n"
+        message += f"📄 **Facturas:** {cantidad}\n"
+        message += f"📈 **Promedio:** {currency} {promedio:,.2f}\n\n"
+        
+        if max_day[0]:
+            message += f"🔝 **Día con más gastos:**\n"
+            message += f"   {max_day[0]} - {currency} {max_day[1]:,.2f}\n\n"
+        
+        if top_3:
+            message += f"🏪 **Top 3 Proveedores:**\n"
+            for idx, (name, amount) in enumerate(top_3, 1):
+                message += f"   {idx}. {name} - {currency} {amount:,.2f}\n"
+        
+        await update.message.reply_text(message)
+        
+        logger.log_info(
+            "Estadisticas generated",
+            chat_id=chat_id,
+            month=month,
+            year=year,
+            total=total
+        )
+        
+    except Exception as e:
+        logger.log_error("Error in estadisticas_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
+async def comparar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /comparar [mes1] [mes2]"""
+    chat_id = str(update.effective_chat.id)
+    
+    try:
+        if not supabase_service.is_enabled():
+            await update.message.reply_text("❌ Servicio de base de datos no disponible.")
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "❌ Debes especificar dos periodos.\n\n"
+                "Uso: `/comparar MM-YYYY MM-YYYY`\n"
+                "Ejemplo: `/comparar 01-2026 12-2025`"
+            )
+            return
+        
+        # Parse periods
+        try:
+            m1, y1 = context.args[0].split("-")
+            m2, y2 = context.args[1].split("-")
+            m1, y1, m2, y2 = int(m1), int(y1), int(m2), int(y2)
+        except:
+            await update.message.reply_text("❌ Formato inválido. Usa: MM-YYYY")
+            return
+        
+        # Period 1
+        fecha1_inicio = datetime(y1, m1, 1).date()
+        if m1 == 12:
+            fecha1_fin = datetime(y1 + 1, 1, 1).date()
+        else:
+            fecha1_fin = datetime(y1, m1 + 1, 1).date()
+        
+        # Period 2
+        fecha2_inicio = datetime(y2, m2, 1).date()
+        if m2 == 12:
+            fecha2_fin = datetime(y2 + 1, 1, 1).date()
+        else:
+            fecha2_fin = datetime(y2, m2 + 1, 1).date()
+        
+        await update.message.reply_text("📊 Comparando periodos...")
+        
+        # Query period 1
+        result1 = supabase_service.client.table("invoices").select("total, currency").eq(
+            "company_id", chat_id
+        ).gte("invoice_date", str(fecha1_inicio)).lt("invoice_date", str(fecha1_fin)).is_(
+            "deleted_at", "null"
+        ).execute()
+        
+        # Query period 2
+        result2 = supabase_service.client.table("invoices").select("total, currency").eq(
+            "company_id", chat_id
+        ).gte("invoice_date", str(fecha2_inicio)).lt("invoice_date", str(fecha2_fin)).is_(
+            "deleted_at", "null"
+        ).execute()
+        
+        inv1 = result1.data if result1.data else []
+        inv2 = result2.data if result2.data else []
+        
+        total1 = sum(float(i.get("total", 0) or 0) for i in inv1)
+        total2 = sum(float(i.get("total", 0) or 0) for i in inv2)
+        count1 = len(inv1)
+        count2 = len(inv2)
+        
+        currency = inv1[0].get("currency", "PEN") if inv1 else "PEN"
+        
+        # Calculate difference
+        diff = total1 - total2
+        diff_pct = ((total1 - total2) / total2 * 100) if total2 > 0 else 0
+        
+        # Format message
+        message = f"📊 **Comparación de Periodos**\n\n"
+        message += f"📅 **Periodo 1:** {m1:02d}/{y1}\n"
+        message += f"   💰 {currency} {total1:,.2f} ({count1} facturas)\n\n"
+        message += f"📅 **Periodo 2:** {m2:02d}/{y2}\n"
+        message += f"   💰 {currency} {total2:,.2f} ({count2} facturas)\n\n"
+        message += f"📈 **Diferencia:**\n"
+        
+        if diff > 0:
+            message += f"   ⬆️ +{currency} {diff:,.2f} (+{diff_pct:.1f}%)\n"
+            message += f"   ⚠️ Gastaste MÁS en {m1:02d}/{y1}"
+        elif diff < 0:
+            message += f"   ⬇️ {currency} {diff:,.2f} ({diff_pct:.1f}%)\n"
+            message += f"   ✅ Gastaste MENOS en {m1:02d}/{y1}"
+        else:
+            message += f"   ➡️ Sin cambios"
+        
+        await update.message.reply_text(message)
+        
+        logger.log_info(
+            "Periods compared",
+            chat_id=chat_id,
+            period1=f"{m1:02d}-{y1}",
+            period2=f"{m2:02d}-{y2}",
+            diff=diff
+        )
+        
+    except Exception as e:
+        logger.log_error("Error in comparar_command", error=str(e), chat_id=chat_id)
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
 def main():
@@ -529,6 +1398,14 @@ def main():
     # Register handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("ayuda", help_command))
+    application.add_handler(CommandHandler("resumen", resumen_command))
+    application.add_handler(CommandHandler("proveedores", proveedores_command))
+    application.add_handler(CommandHandler("items", items_command))
+    application.add_handler(CommandHandler("buscar", buscar_command))
+    application.add_handler(CommandHandler("historial", historial_command))
+    application.add_handler(CommandHandler("eliminar", eliminar_command))
+    application.add_handler(CommandHandler("estadisticas", estadisticas_command))
+    application.add_handler(CommandHandler("comparar", comparar_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     application.add_handler(CallbackQueryHandler(button_callback))

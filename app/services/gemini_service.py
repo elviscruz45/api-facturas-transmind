@@ -154,6 +154,61 @@ Rules:
                     str(e), filename, sequence_id
                 )
     
+    async def extract_invoice_from_pdf(self, pdf_base64: str, filename: str,
+                                      sequence_id: int) -> Dict:
+        """Extract invoice data from PDF using Gemini"""
+        
+        async with self.semaphore:
+            try:
+                if not self.model:
+                    if not self.initialize_model():
+                        return self._create_error_response(
+                            "Gemini model not initialized", filename, sequence_id
+                        )
+                
+                # Prepare PDF part
+                pdf_part = self.prepare_image_part(pdf_base64, "application/pdf")
+                
+                logger.log_file_processing(
+                    filename=filename,
+                    sequence_id=sequence_id,
+                    file_type="pdf",
+                    status="sending_to_gemini"
+                )
+                
+                # Generate content from PDF
+                response = await asyncio.wait_for(
+                    self._call_gemini_async(pdf_part, self.invoice_prompt),
+                    timeout=self.timeout_seconds
+                )
+                
+                # Delay conservador para 15 RPM (6s = ~10 requests/min con margen de seguridad)
+                await asyncio.sleep(6)
+                
+                return self._parse_gemini_response(response, filename, sequence_id)
+                
+            except asyncio.TimeoutError:
+                logger.log_error(
+                    "Gemini API timeout",
+                    filename=filename,
+                    sequence_id=sequence_id,
+                    timeout_seconds=self.timeout_seconds
+                )
+                return self._create_error_response(
+                    "API timeout", filename, sequence_id
+                )
+            
+            except Exception as e:
+                logger.log_error(
+                    "Gemini PDF processing failed",
+                    filename=filename,
+                    sequence_id=sequence_id,
+                    error=str(e)
+                )
+                return self._create_error_response(
+                    str(e), filename, sequence_id
+                )
+    
     async def extract_invoice_from_text(self, text_content: str, filename: str,
                                       sequence_id: int) -> Dict:
         """Extract invoice data from text content"""
