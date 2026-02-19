@@ -1,5 +1,5 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException, status, Form, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from app.services.zip_handler import ZipHandler
 from app.services.processing_orchestrator import orchestrator
 from app.services.storage_service import storage_service
@@ -12,6 +12,7 @@ from typing import Optional
 import io
 import base64
 import httpx
+import uuid
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from datetime import datetime, timedelta
@@ -904,7 +905,7 @@ async def export_excel(
     phone_number: Optional[str] = Query(None, description="Filter by phone number/company")
 ):
     """
-    Export invoices and items to Excel with date filters
+    Export invoices and items to Excel and upload to Cloud Storage
     
     - **report_type**: Type of report - 'daily', 'monthly', or 'custom'
     - **start_date**: Start date (YYYY-MM-DD) - required for custom reports
@@ -915,9 +916,17 @@ async def export_excel(
     - Daily: `/export-excel?report_type=daily`
     - Monthly: `/export-excel?report_type=monthly`
     - Custom: `/export-excel?report_type=custom&start_date=2024-01-01&end_date=2024-03-31`
-    - With filter: `/export-excel?report_type=monthly&phone_number=+51987654321`
+    - With filter: `/export-excel?report_type=monthly&phone_number=51987654321`
     
-    Returns Excel file with 2 sheets: Invoices and Items
+    Returns JSON with:
+    - **file_url**: Public URL to download the Excel file (expires in 1 hour)
+    - **filename**: Name of the generated Excel file
+    - **statistics**: Invoice and item counts
+    - **date_range**: Start and end dates of the report
+    
+    The Excel file contains 2 sheets:
+    1. **Facturas** - Main invoice data
+    2. **Items de Facturas** - Invoice line items
     """
     logger.log_info(
         "Excel export requested",
@@ -1103,14 +1112,14 @@ async def export_excel(
             ws_items.column_dimensions[ws_items.cell(row=1, column=col).column_letter].width = width
         
         # ========================================================================
-        # SAVE AND RETURN
+        # SAVE AND UPLOAD TO CLOUD STORAGE
         # ========================================================================
         excel_file = io.BytesIO()
         wb.save(excel_file)
         excel_file.seek(0)
         
         logger.log_info(
-            "Excel export completed",
+            "Excel file generated in memory",
             report_type=report_type,
             invoices_count=len(invoices),
             items_count=len(items),
@@ -1118,20 +1127,140 @@ async def export_excel(
             end_date=calculated_end
         )
         
-        # Prepare response headers
+        # Upload to Cloud Storage
         filename = f"{report_name}.xlsx"
-        response_headers = {
-            "Content-Disposition": f"attachment; filename={filename}",
-            "X-Total-Invoices": str(len(invoices)),
-            "X-Total-Items": str(len(items)),
-            "X-Report-Type": report_type,
-            "X-Date-Range": f"{calculated_start} to {calculated_end}"
-        }
         
-        return StreamingResponse(
-            excel_file,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=response_headers
+        # Initialize storage service if needed
+        if not storage_service.bucket:
+            storage_initialized = storage_service.initialize()
+            if not storage_initialized:
+                logger.log_error("Failed to initialize Cloud Storage")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Cloud Storage service is not available"
+                )
+        
+        # Upload Excel to Cloud Storage with custom path for reports
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            company_prefix = f"reports/{phone_number}/" if phone_number else "reports/all/"
+            year_month = datetime.now().strftime("%Y/%m")
+            report_uuid = str(uuid.uuid4())[:8]
+            blob_path = f"{company_prefix}{year_month}/{timestamp}_{report_uuid}_{filename}"
+            
+            blob = storage_service.bucket.blob(blob_path)
+            
+            # Set metadata
+            blob.metadata = {
+                "report_type": report_type,
+                "phone_number": phone_number or "all",
+                "start_date": calculated_start,
+                "end_date": calculated_end,
+                "total_invoices": str(len(invoices)),
+                "total_items": str(len(items)),
+                "generated_at": timestamp,
+                "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            }
+            
+            # Upload Excel
+            excel_file.seek(0)
+            blob.upload_from_file(
+                excel_file,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            # Try to generate signed URL first (1 hour expiration)
+            file_url = None
+            url_type = "unknown"
+            
+            if storage_service.can_sign_urls:
+                try:
+                    file_url = blob.generate_signed_url(
+                        expiration=timedelta(hours=1),
+                        method="GET"
+                    )
+                    url_type = "signed_url_1h"
+                    logger.log_info("✅ Generated signed URL (1 hour expiration)")
+                except Exception as e:
+                    logger.log_warning(
+                        "Failed to generate signed URL",
+                        error=str(e)
+                    )
+            
+            # If signed URL failed or not available, make blob public
+            if not file_url:
+                try:
+                    logger.log_info("Making blob public...")
+                    blob.make_public()
+                    file_url = blob.public_url
+                    url_type = "public_url"
+                    logger.log_info("✅ Blob made public successfully")
+                except Exception as e:
+                    logger.log_error(
+                        "Failed to make blob public",
+                        error=str(e)
+                    )
+                    # Last resort: use public_url anyway (might not work)
+                    file_url = blob.public_url
+                    url_type = "public_url_unverified"
+            
+            logger.log_info(
+                "✅ Excel uploaded to Cloud Storage",
+                blob_path=blob_path,
+                file_url=file_url[:100] + "..." if file_url and len(file_url) > 100 else file_url,
+                url_type=url_type,
+                report_type=report_type,
+                invoices_count=len(invoices),
+                items_count=len(items),
+                can_sign_urls=storage_service.can_sign_urls
+            )
+            
+            if not file_url:
+                raise Exception("Failed to generate accessible URL for Excel file")
+            
+        except Exception as e:
+            logger.log_error(
+                "Failed to upload Excel to Cloud Storage",
+                error=str(e),
+                report_type=report_type
+            )
+            import traceback
+            logger.log_error(
+                "Upload traceback",
+                traceback=traceback.format_exc()
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to upload report to storage: {str(e)}"
+            )
+        
+        # Return JSON response with file URL
+        return JSONResponse(
+            content={
+                "file_url": file_url,
+                "filename": filename,
+                "blob_path": blob_path,
+                "report_type": report_type,
+                "date_range": {
+                    "start": calculated_start,
+                    "end": calculated_end
+                },
+                "statistics": {
+                    "total_invoices": len(invoices),
+                    "total_items": len(items)
+                },
+                "generated_at": timestamp,
+                "url_type": url_type,
+                "expires_in": "1 hour" if url_type == "signed_url_1h" else "permanent",
+                "access": "public" if url_type.startswith("public") else "temporary"
+            },
+            headers={
+                "X-Total-Invoices": str(len(invoices)),
+                "X-Total-Items": str(len(items)),
+                "X-Report-Type": report_type,
+                "X-Date-Range": f"{calculated_start} to {calculated_end}",
+                "X-URL-Type": url_type
+            }
         )
         
     except HTTPException:
@@ -1139,14 +1268,20 @@ async def export_excel(
         
     except Exception as e:
         logger.log_error(
-            "Unexpected error during Excel export",
+            "Unexpected error during Excel report generation",
             error=str(e),
+            error_type=type(e).__name__,
             report_type=report_type
+        )
+        import traceback
+        logger.log_error(
+            "Full traceback",
+            traceback=traceback.format_exc()
         )
         
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Internal server error: {str(e)}"
+            detail=f"Failed to generate report: {str(e)}"
         )
 
 
