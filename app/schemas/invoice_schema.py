@@ -58,3 +58,43 @@ class ProcessingResponse(BaseModel):
     errors: List[dict]
     total_processed: int
     success_count: int
+
+class WhatsAppInvoiceItem(BaseModel):
+    """Item model for WhatsApp invoice data (Spanish field names)"""
+    descripcion: Optional[str] = None
+    cantidad: Optional[float] = None
+    precioUnitario: Optional[float] = None
+    total: Optional[float] = None
+    unidad: Optional[str] = None
+
+class SaveInvoiceRequest(BaseModel):
+    """Request model for saving invoice data from WhatsApp API"""
+    # Main invoice fields (English/snake_case from WhatsApp)
+    supplier_ruc: Optional[str] = None
+    supplier_name: Optional[str] = None
+    customer_ruc: Optional[str] = None
+    customer_name: Optional[str] = None
+    invoice_date: Optional[str] = None
+    invoice_number: Optional[str] = None
+    subtotal: Optional[float] = None
+    igv: Optional[float] = None  # IGV/Tax
+    total: Optional[float] = None
+    currency: Optional[str] = "PEN"
+    
+    # Items (Spanish field names)
+    items: Optional[List[WhatsAppInvoiceItem]] = None
+    
+    # Metadata
+    confidence_score: Optional[float] = 0.0
+    phoneNumber: str  # Required field
+    source_file: Optional[str] = None
+    source_url: Optional[str] = None
+    mime_type: Optional[str] = None
+    job_id: Optional[str] = None
+    createdAt: Optional[str] = None
+
+class SaveInvoiceResponse(BaseModel):
+    """Response model for saved invoice"""
+    id: int
+    success: bool = True
+    message: str = "Invoice saved successfully"

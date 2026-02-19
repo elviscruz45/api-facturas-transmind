@@ -119,7 +119,7 @@ Rules:
                     file_type="image",
                     status="sending_to_gemini"
                 )
-                
+
                 response = await asyncio.wait_for(
                     self._call_gemini_async(image_part, self.invoice_prompt),
                     timeout=self.timeout_seconds
@@ -270,7 +270,7 @@ Rules:
                 # Run in thread pool to avoid blocking
                 loop = asyncio.get_event_loop()
                 return await loop.run_in_executor(None, _sync_call)
-                
+
             except Exception as e:
                 error_str = str(e)
                 

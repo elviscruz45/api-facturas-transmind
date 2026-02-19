@@ -31,6 +31,9 @@ logger = setup_logger("telegram_bot")
 # Temporary storage for pending files (file_id -> file_info)
 pending_files: Dict[str, Dict] = {}
 
+# Temporary storage for pending validations (validation_key -> extracted_data)
+pending_validations: Dict[str, Dict] = {}
+
 
 def create_excel_from_invoice(invoice: InvoiceSchema) -> io.BytesIO:
     """Create Excel file from a single invoice"""
@@ -177,7 +180,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle photo uploads"""
     try:
         chat_id = str(update.effective_chat.id)
-        
         # Get largest photo
         photo = update.message.photo[-1]
         file_id = photo.file_id
@@ -202,7 +204,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_pending=len(pending_files),
             pending_keys=list(pending_files.keys())
         )
-        
+
         # Create confirmation buttons
         keyboard = [
             [
@@ -210,6 +212,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("❌ No", callback_data=f"no_{callback_key}")
             ]
         ]
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
@@ -427,82 +430,51 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 total=invoice.total
             )
             
-            # Generate Excel
-            excel_file = create_excel_from_invoice(invoice)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            excel_filename = f"factura_{timestamp}.xlsx"
+            # Store extracted data for validation
+            validation_key = f"val_{file_info['chat_id']}_{datetime.now().timestamp()}"
+            pending_validations[validation_key] = {
+                "invoice": invoice,
+                "file_info": file_info,
+                "file_id": file_id
+            }
             
-            # Upload to Cloud Storage (optional, won't fail if it doesn't work)
-            excel_blob_path = None
-            if storage_service.client:
-                try:
-                    excel_metadata = storage_service.upload_excel(
-                        excel_file,
-                        excel_filename,
-                        company_id=file_info["chat_id"]
-                    )
-                    if excel_metadata:
-                        excel_blob_path = excel_metadata.get("blob_path")
-                    excel_file.seek(0)  # Reset for sending
-                except Exception as storage_error:
-                    logger.log_warning(
-                        "Failed to upload to Cloud Storage",
-                        error=str(storage_error)
-                    )
+            # Show extracted data for validation
+            items_summary = ""
+            if invoice.items and len(invoice.items) > 0:
+                items_summary = f"\n📦 **Items:** {len(invoice.items)} producto(s)"
+                for idx, item in enumerate(invoice.items[:3], 1):
+                    items_summary += f"\n   {idx}. {item.description or 'Sin descripción'}" 
+                    items_summary += f" - {item.quantity}x S/ {item.unit_price or 0:.2f}"
+                if len(invoice.items) > 3:
+                    items_summary += f"\n   ... y {len(invoice.items) - 3} más"
             
-            # Save to Supabase
-            record_id = None
-            if supabase_service.is_enabled():
-                try:
-                    # Save processing record
-                    record_id = await supabase_service.save_processing_record(
-                        chat_id=file_info["chat_id"],
-                        zip_blob_path=None,
-                        excel_blob_path=excel_blob_path,
-                        total_files=1,
-                        success_files=1,
-                        error_files=0,
-                        telegram_file_id=file_id,
-                        telegram_file_unique_id=file_info["file_unique_id"]
-                    )
-                    
-                    # Save invoice
-                    if record_id:
-                        await supabase_service.save_invoices_batch(
-                            invoices=[invoice],
-                            chat_id=file_info["chat_id"],
-                            record_id=record_id
-                        )
-                    
-                    logger.log_info(
-                        "Data saved to Supabase",
-                        record_id=record_id,
-                        chat_id=file_info["chat_id"]
-                    )
-                except Exception as db_error:
-                    logger.log_error(
-                        "Failed to save to Supabase",
-                        error=str(db_error)
-                    )
-            
-            # Send Excel to user
-            caption = (
-                f"✅ Factura procesada exitosamente\n\n"
-                f"💰 Total: {invoice.currency or 'PEN'} {invoice.total or 0:.2f}\n"
-                f"📊 IGV: {invoice.currency or 'PEN'} {invoice.tax or 0:.2f}\n"
-                f"📄 Nro: {invoice.invoice_number or 'N/A'}"
+            validation_message = (
+                f"📋 **Datos extraídos por IA**\n\n"
+                f"📄 **Nro. Factura:** {invoice.invoice_number or 'N/A'}\n"
+                f"📅 **Fecha:** {invoice.invoice_date or 'N/A'}\n"
+                f"🏪 **Proveedor:** {invoice.supplier_name or 'N/A'}\n"
+                f"🆔 **RUC:** {invoice.supplier_ruc or 'N/A'}\n"
+                f"👤 **Cliente:** {invoice.customer_name or 'N/A'}\n\n"
+                f"💰 **Subtotal:** {invoice.currency or 'PEN'} {invoice.subtotal or 0:.2f}\n"
+                f"📊 **IGV:** {invoice.currency or 'PEN'} {invoice.tax or 0:.2f}\n"
+                f"💵 **Total:** {invoice.currency or 'PEN'} {invoice.total or 0:.2f}\n"
+                f"{items_summary}\n\n"
+                f"✅ **¿Los datos son correctos?**"
             )
             
-            await context.bot.send_document(
-                chat_id=file_info["chat_id"],
-                document=excel_file,
-                filename=excel_filename,
-                caption=caption
-            )
+            # Create validation buttons
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Guardar", callback_data=f"save_{validation_key}"),
+                    InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{validation_key}")
+                ],
+                [InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{validation_key}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
             
-            await query.edit_message_text("✅ ¡Listo! Excel enviado.")
+            await query.edit_message_text(validation_message, reply_markup=reply_markup)
             
-            # Remove from pending
+            # Remove from pending files
             del pending_files[callback_key]
             
             logger.log_info(
@@ -527,6 +499,215 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Remove from pending
             if callback_key in pending_files:
                 del pending_files[callback_key]
+    
+    # Handle validation callbacks
+    elif callback_data.startswith("save_"):
+        validation_key = callback_data.replace("save_", "")
+        validation_data = pending_validations.get(validation_key)
+        
+        if not validation_data:
+            await query.edit_message_text("⚠️ Sesión expirada. Por favor, procesa la factura nuevamente.")
+            return
+        
+        await query.edit_message_text("💾 Guardando factura...")
+        
+        try:
+            invoice = validation_data["invoice"]
+            file_info = validation_data["file_info"]
+            file_id = validation_data["file_id"]
+            
+            # Generate Excel
+            excel_file = create_excel_from_invoice(invoice)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            excel_filename = f"factura_{timestamp}.xlsx"
+            
+            # Upload to Cloud Storage (optional)
+            excel_blob_path = None
+            if storage_service.client:
+                try:
+                    excel_metadata = storage_service.upload_excel(
+                        excel_file,
+                        excel_filename,
+                        company_id=file_info["chat_id"]
+                    )
+                    if excel_metadata:
+                        excel_blob_path = excel_metadata.get("blob_path")
+                    excel_file.seek(0)
+                except Exception as storage_error:
+                    logger.log_warning(
+                        "Failed to upload to Cloud Storage",
+                        error=str(storage_error)
+                    )
+            
+            # Save to Supabase
+            record_id = None
+            if supabase_service.is_enabled():
+                try:
+                    record_id = await supabase_service.save_processing_record(
+                        chat_id=file_info["chat_id"],
+                        zip_blob_path=None,
+                        excel_blob_path=excel_blob_path,
+                        total_files=1,
+                        success_files=1,
+                        error_files=0,
+                        telegram_file_id=file_id,
+                        telegram_file_unique_id=file_info["file_unique_id"]
+                    )
+                    
+                    if record_id:
+                        await supabase_service.save_invoices_batch(
+                            invoices=[invoice],
+                            chat_id=file_info["chat_id"],
+                            record_id=record_id
+                        )
+                    
+                    logger.log_info(
+                        "Data saved to Supabase",
+                        record_id=record_id,
+                        chat_id=file_info["chat_id"]
+                    )
+                except Exception as db_error:
+                    logger.log_error(
+                        "Failed to save to Supabase",
+                        error=str(db_error)
+                    )
+            
+            # Send Excel to user
+            caption = (
+                f"✅ Factura guardada exitosamente\n\n"
+                f"💰 Total: {invoice.currency or 'PEN'} {invoice.total or 0:.2f}\n"
+                f"📊 IGV: {invoice.currency or 'PEN'} {invoice.tax or 0:.2f}\n"
+                f"📄 Nro: {invoice.invoice_number or 'N/A'}"
+            )
+            
+            await context.bot.send_document(
+                chat_id=file_info["chat_id"],
+                document=excel_file,
+                filename=excel_filename,
+                caption=caption
+            )
+            
+            await query.edit_message_text("✅ ¡Factura guardada y Excel enviado!")
+            
+            # Remove from pending validations
+            del pending_validations[validation_key]
+            
+        except Exception as e:
+            logger.log_error("Error saving validated invoice", error=str(e))
+            await query.edit_message_text(f"❌ Error al guardar: {str(e)}")
+    
+    elif callback_data.startswith("edit_"):
+        validation_key = callback_data.replace("edit_", "")
+        validation_data = pending_validations.get(validation_key)
+        
+        if not validation_data:
+            await query.edit_message_text("⚠️ Sesión expirada. Por favor, procesa la factura nuevamente.")
+            return
+        
+        # Show editable fields
+        keyboard = [
+            [InlineKeyboardButton("📄 Nro. Factura", callback_data=f"field_invoice_number_{validation_key}")],
+            [InlineKeyboardButton("📅 Fecha", callback_data=f"field_invoice_date_{validation_key}")],
+            [InlineKeyboardButton("🏪 Proveedor", callback_data=f"field_supplier_name_{validation_key}")],
+            [InlineKeyboardButton("🆔 RUC Proveedor", callback_data=f"field_supplier_ruc_{validation_key}")],
+            [InlineKeyboardButton("👤 Cliente", callback_data=f"field_customer_name_{validation_key}")],
+            [InlineKeyboardButton("💰 Subtotal", callback_data=f"field_subtotal_{validation_key}")],
+            [InlineKeyboardButton("📊 IGV", callback_data=f"field_tax_{validation_key}")],
+            [InlineKeyboardButton("💵 Total", callback_data=f"field_total_{validation_key}")],
+            [InlineKeyboardButton("🔙 Volver", callback_data=f"back_{validation_key}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "✏️ **Selecciona el campo a editar:**",
+            reply_markup=reply_markup
+        )
+    
+    elif callback_data.startswith("field_"):
+        # Parse: "field_invoice_number_val_123" -> field_name="invoice_number", validation_key="val_123"
+        # Remove "field_" prefix
+        remaining = callback_data.replace("field_", "", 1)
+        
+        # Find where validation_key starts (it always starts with "val_")
+        val_index = remaining.find("_val_")
+        if val_index != -1:
+            field_name = remaining[:val_index]
+            validation_key = remaining[val_index + 1:]  # Skip the leading underscore
+            
+            # Store the field being edited in context
+            context.user_data['editing_field'] = field_name
+            context.user_data['editing_validation_key'] = validation_key
+            
+            field_labels = {
+                "invoice_number": "número de factura",
+                "invoice_date": "fecha (DD-MM-YYYY)",
+                "supplier_name": "nombre del proveedor",
+                "supplier_ruc": "RUC del proveedor",
+                "customer_name": "nombre del cliente",
+                "subtotal": "subtotal",
+                "tax": "IGV",
+                "total": "total"
+            }
+            
+            field_label = field_labels.get(field_name, field_name)
+            
+            await query.edit_message_text(
+                f"✏️ Envía el nuevo valor para **{field_label}**\n\n"
+                f"O usa /cancelar para volver"
+            )
+    
+    elif callback_data.startswith("back_"):
+        validation_key = callback_data.replace("back_", "")
+        validation_data = pending_validations.get(validation_key)
+        
+        if not validation_data:
+            await query.edit_message_text("⚠️ Sesión expirada. Por favor, procesa la factura nuevamente.")
+            return
+        
+        # Show validation summary again
+        invoice = validation_data["invoice"]
+        
+        items_summary = ""
+        if invoice.items and len(invoice.items) > 0:
+            items_summary = f"\n📦 **Items:** {len(invoice.items)} producto(s)"
+            for idx, item in enumerate(invoice.items[:3], 1):
+                items_summary += f"\n   {idx}. {item.description or 'Sin descripción'}"
+                items_summary += f" - {item.quantity}x S/ {item.unit_price or 0:.2f}"
+            if len(invoice.items) > 3:
+                items_summary += f"\n   ... y {len(invoice.items) - 3} más"
+        
+        validation_message = (
+            f"📋 **Datos extraídos por IA**\n\n"
+            f"📄 **Nro. Factura:** {invoice.invoice_number or 'N/A'}\n"
+            f"📅 **Fecha:** {invoice.invoice_date or 'N/A'}\n"
+            f"🏪 **Proveedor:** {invoice.supplier_name or 'N/A'}\n"
+            f"🆔 **RUC:** {invoice.supplier_ruc or 'N/A'}\n"
+            f"👤 **Cliente:** {invoice.customer_name or 'N/A'}\n\n"
+            f"💰 **Subtotal:** {invoice.currency or 'PEN'} {invoice.subtotal or 0:.2f}\n"
+            f"📊 **IGV:** {invoice.currency or 'PEN'} {invoice.tax or 0:.2f}\n"
+            f"💵 **Total:** {invoice.currency or 'PEN'} {invoice.total or 0:.2f}\n"
+            f"{items_summary}\n\n"
+            f"✅ **¿Los datos son correctos?**"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Guardar", callback_data=f"save_{validation_key}"),
+                InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{validation_key}")
+            ],
+            [InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{validation_key}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(validation_message, reply_markup=reply_markup)
+    
+    elif callback_data.startswith("cancel_"):
+        validation_key = callback_data.replace("cancel_", "")
+        
+        if validation_key in pending_validations:
+            del pending_validations[validation_key]
+        
+        await query.edit_message_text("❌ Procesamiento cancelado")
     
     # Handle delete callbacks
     elif callback_data.startswith("delete_"):
@@ -1382,6 +1563,102 @@ async def comparar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 
+async def cancelar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /cancelar - cancel field editing"""
+    if 'editing_field' in context.user_data:
+        del context.user_data['editing_field']
+        del context.user_data['editing_validation_key']
+        await update.message.reply_text("❌ Edición cancelada")
+    else:
+        await update.message.reply_text("⚠️ No hay ninguna edición en curso")
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages for field editing"""
+    # Check if user is editing a field
+    if 'editing_field' not in context.user_data:
+        return
+    
+    field_name = context.user_data.get('editing_field')
+    validation_key = context.user_data.get('editing_validation_key')
+    new_value = update.message.text.strip()
+    
+    validation_data = pending_validations.get(validation_key)
+    if not validation_data:
+        await update.message.reply_text("⚠️ Sesión expirada. Por favor, procesa la factura nuevamente.")
+        del context.user_data['editing_field']
+        del context.user_data['editing_validation_key']
+        return
+    
+    invoice = validation_data["invoice"]
+    
+    # Update the field
+    try:
+        if field_name == "invoice_number":
+            invoice.invoice_number = new_value
+        elif field_name == "invoice_date":
+            invoice.invoice_date = new_value
+        elif field_name == "supplier_name":
+            invoice.supplier_name = new_value
+        elif field_name == "supplier_ruc":
+            invoice.supplier_ruc = new_value
+        elif field_name == "customer_name":
+            invoice.customer_name = new_value
+        elif field_name == "subtotal":
+            invoice.subtotal = float(new_value)
+        elif field_name == "tax":
+            invoice.tax = float(new_value)
+        elif field_name == "total":
+            invoice.total = float(new_value)
+        
+        await update.message.reply_text(f"✅ Campo actualizado: {new_value}")
+        
+        # Clear editing state
+        del context.user_data['editing_field']
+        del context.user_data['editing_validation_key']
+        
+        # Show updated validation summary
+        items_summary = ""
+        if invoice.items and len(invoice.items) > 0:
+            items_summary = f"\n📦 **Items:** {len(invoice.items)} producto(s)"
+            for idx, item in enumerate(invoice.items[:3], 1):
+                items_summary += f"\n   {idx}. {item.description or 'Sin descripción'}"
+                items_summary += f" - {item.quantity}x S/ {item.unit_price or 0:.2f}"
+            if len(invoice.items) > 3:
+                items_summary += f"\n   ... y {len(invoice.items) - 3} más"
+        
+        validation_message = (
+            f"📋 **Datos actualizados**\n\n"
+            f"📄 **Nro. Factura:** {invoice.invoice_number or 'N/A'}\n"
+            f"📅 **Fecha:** {invoice.invoice_date or 'N/A'}\n"
+            f"🏪 **Proveedor:** {invoice.supplier_name or 'N/A'}\n"
+            f"🆔 **RUC:** {invoice.supplier_ruc or 'N/A'}\n"
+            f"👤 **Cliente:** {invoice.customer_name or 'N/A'}\n\n"
+            f"💰 **Subtotal:** {invoice.currency or 'PEN'} {invoice.subtotal or 0:.2f}\n"
+            f"📊 **IGV:** {invoice.currency or 'PEN'} {invoice.tax or 0:.2f}\n"
+            f"💵 **Total:** {invoice.currency or 'PEN'} {invoice.total or 0:.2f}\n"
+            f"{items_summary}\n\n"
+            f"✅ **¿Los datos son correctos?**"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Guardar", callback_data=f"save_{validation_key}"),
+                InlineKeyboardButton("✏️ Editar", callback_data=f"edit_{validation_key}")
+            ],
+            [InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{validation_key}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(validation_message, reply_markup=reply_markup)
+        
+    except ValueError:
+        await update.message.reply_text("❌ Valor inválido. Intenta nuevamente o usa /cancelar")
+    except Exception as e:
+        logger.log_error("Error updating field", error=str(e))
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+
 def main():
     """Start the bot"""
     if not settings.telegram_bot_token:
@@ -1406,9 +1683,11 @@ def main():
     application.add_handler(CommandHandler("eliminar", eliminar_command))
     application.add_handler(CommandHandler("estadisticas", estadisticas_command))
     application.add_handler(CommandHandler("comparar", comparar_command))
+    application.add_handler(CommandHandler("cancelar", cancelar_command))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.PDF, handle_document))
     application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     
     # Start bot
     logger.log_info("Bot is running... Press Ctrl+C to stop.")

@@ -25,6 +25,7 @@ vertexai = "^1.38.1"
 openpyxl = "^3.1.2"
 supabase = "^2.27.2"
 python-telegram-bot = "^22.5"
+httpx = "^0.25.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"
