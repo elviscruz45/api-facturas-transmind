@@ -567,6 +567,9 @@ class SupabaseService:
         chat_id: Optional[str] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        timestamp_start: Optional[str] = None,
+        timestamp_end: Optional[str] = None,
+        date_field: str = "invoice_date",
         report_type: str = "custom"
     ) -> tuple[List[Dict], List[Dict]]:
         """
@@ -574,42 +577,163 @@ class SupabaseService:
         
         Args:
             chat_id: Company identifier (optional, None = all companies)
-            start_date: Start date filter (YYYY-MM-DD)
-            end_date: End date filter (YYYY-MM-DD)
+            start_date: Start date filter (YYYY-MM-DD) - used for invoice_date
+            end_date: End date filter (YYYY-MM-DD) - used for invoice_date
+            timestamp_start: Start timestamp (ISO format) - used for created_at
+            timestamp_end: End timestamp (ISO format) - used for created_at
+            date_field: Field to filter by ('invoice_date' or 'created_at')
             report_type: 'daily', 'monthly', or 'custom'
             
         Returns:
             Tuple of (invoices_list, items_list)
         """
         if not self.is_enabled():
+            logger.log_error("🔴 Supabase is not enabled for get_invoices_with_items")
             return [], []
         
         try:
+            from datetime import datetime as dt
+            
+            logger.log_info(
+                "🔍 SUPABASE QUERY - get_invoices_with_items started",
+                chat_id=chat_id or "ALL_COMPANIES",
+                start_date=start_date,
+                end_date=end_date,
+                timestamp_start=timestamp_start,
+                timestamp_end=timestamp_end,
+                date_field=date_field,
+                report_type=report_type
+            )
+            
+            # Log month info if monthly report
+            if report_type == "monthly" and (timestamp_start or start_date):
+                try:
+                    if timestamp_start:
+                        start_dt = dt.fromisoformat(timestamp_start)
+                    else:
+                        start_dt = dt.fromisoformat(start_date)
+                    month_name = start_dt.strftime('%B %Y')
+                    logger.log_info(
+                        "📅 MONTHLY REPORT DETECTION",
+                        month=month_name,
+                        filter_field=date_field,
+                        note=f"Filtering by {date_field} for {month_name}"
+                    )
+                except:
+                    pass
+            
             # Build invoices query
             query = self.client.table("invoices").select("*")
             
             # Filter by company if provided
             if chat_id:
                 query = query.eq("company_id", chat_id)
+                logger.log_info("📌 Filtering by company_id", company_id=chat_id)
+            else:
+                logger.log_info("📌 No company filter - querying ALL companies")
             
-            # Filter by date range
-            if start_date:
-                query = query.gte("invoice_date", start_date)
-            if end_date:
-                query = query.lte("invoice_date", end_date)
+            # Filter by date range or timestamp range
+            # Use date_field parameter to determine which field to filter
+            if date_field == "created_at" and (timestamp_start or timestamp_end):
+                # Use created_at for filtering by exact timestamp
+                if timestamp_start:
+                    query = query.gte("created_at", timestamp_start)
+                    logger.log_info("⏰ Filtering created_at >= ", timestamp=timestamp_start)
+                if timestamp_end:
+                    query = query.lte("created_at", timestamp_end)
+                    logger.log_info("⏰ Filtering created_at <= ", timestamp=timestamp_end)
+                logger.log_info("📊 Using created_at (timestamp) - for operational/audit reports")
+            else:
+                # Use invoice_date (default)
+                if start_date:
+                    query = query.gte("invoice_date", start_date)
+                    logger.log_info("📅 Filtering invoice_date >= ", start_date=start_date)
+                if end_date:
+                    query = query.lte("invoice_date", end_date)
+                    logger.log_info("📅 Filtering invoice_date <= ", end_date=end_date)
+                logger.log_info("📊 Using invoice_date (date) - for accounting/fiscal reports")
             
             # Exclude deleted invoices
             query = query.eq("deleted", False)
             
+            logger.log_info(
+                "⏳ Executing Supabase query for invoices...",
+                filters={
+                    "company_id": chat_id or "all",
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "timestamp_start": timestamp_start,
+                    "timestamp_end": timestamp_end,
+                    "filter_field": date_field,
+                    "deleted": False
+                }
+            )
+            
             # Execute query
-            invoices_result = query.order("invoice_date", desc=True).execute()
+            invoices_result = query.order("created_at", desc=True).execute()
             invoices = invoices_result.data if invoices_result.data else []
+            
+            logger.log_info(
+                "✅ Invoices query executed",
+                invoices_count=len(invoices),
+                has_data=bool(invoices)
+            )
             
             # Get invoice IDs for items query
             if not invoices:
+                logger.log_warning(
+                    "⚠️ No invoices found matching criteria",
+                    chat_id=chat_id or "all",
+                    start_date=start_date,
+                    end_date=end_date
+                )
                 return [], []
             
+            # Log invoice date distribution
+            invoice_dates = [inv.get('invoice_date') for inv in invoices if inv.get('invoice_date')]
+            created_ats = [inv.get('created_at') for inv in invoices if inv.get('created_at')]
+            
+            if invoice_dates:
+                logger.log_info(
+                    "📊 Invoice date distribution (invoice_date field)",
+                    total_invoices=len(invoices),
+                    earliest_invoice_date=min(invoice_dates),
+                    latest_invoice_date=max(invoice_dates),
+                    unique_dates=len(set(invoice_dates))
+                )
+            
+            if created_ats:
+                logger.log_info(
+                    "📊 Created timestamp distribution (created_at field)",
+                    earliest_created=min(created_ats),
+                    latest_created=max(created_ats),
+                    requested_timestamp_start=timestamp_start,
+                    requested_timestamp_end=timestamp_end
+                )
+                
+                # Log sample of invoices
+                logger.log_info(
+                    "📋 First 5 invoices retrieved",
+                    samples=[
+                        {
+                            "id": inv.get('id'),
+                            "invoice_number": inv.get('invoice_number'),
+                            "invoice_date": inv.get('invoice_date'),
+                            "created_at": inv.get('created_at'),
+                            "company_id": inv.get('company_id'),
+                            "total": inv.get('total')
+                        }
+                        for inv in invoices[:5]
+                    ]
+                )
+            
             invoice_ids = [inv['id'] for inv in invoices]
+            
+            logger.log_info(
+                "🔍 Querying invoice_items for retrieved invoices",
+                invoice_ids_count=len(invoice_ids),
+                invoice_ids_sample=invoice_ids[:5]
+            )
             
             # Build items query
             items_query = self.client.table("invoice_items").select("*").in_(
@@ -621,21 +745,31 @@ class SupabaseService:
             items = items_result.data if items_result.data else []
             
             logger.log_info(
-                "Retrieved invoices with items for export",
+                "✅ Retrieved invoices with items for export - COMPLETE",
                 invoices_count=len(invoices),
                 items_count=len(items),
-                chat_id=chat_id,
+                items_per_invoice=round(len(items) / len(invoices), 2) if invoices else 0,
+                chat_id=chat_id or "all",
                 start_date=start_date,
-                end_date=end_date
+                end_date=end_date,
+                report_type=report_type
             )
             
             return invoices, items
             
         except Exception as e:
             logger.log_error(
-                "Failed to get invoices with items",
-                chat_id=chat_id,
-                error=str(e)
+                "❌ Failed to get invoices with items",
+                chat_id=chat_id or "all",
+                start_date=start_date,
+                end_date=end_date,
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            import traceback
+            logger.log_error(
+                "📍 Traceback from get_invoices_with_items",
+                traceback=traceback.format_exc()
             )
             return [], []
     
@@ -782,6 +916,9 @@ class SupabaseService:
                 "tax": safe_float(invoice_data.get('igv')),
                 "total": safe_float(invoice_data.get('total')),
                 "currency": invoice_data.get('currency', 'PEN'),
+                "cc_or_placa": invoice_data.get('cc_or_placa'),  # New field
+                "document_type": invoice_data.get('document_type'),  # New field
+                "tipo_costo": invoice_data.get('tipo_costo'),  # New field
                 "confidence_score": safe_float(invoice_data.get('confidence_score'), 0.0),
                 "source_file": invoice_data.get('source_file') or f"whatsapp_{phone_number}",
                 "source_url": invoice_data.get('source_url'),

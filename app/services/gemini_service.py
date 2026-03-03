@@ -4,6 +4,7 @@ from typing import Dict, Optional
 from vertexai.generative_models import GenerativeModel, Part, GenerationConfig
 from google.cloud import aiplatform
 from google.api_core import retry, exceptions
+from google.api_core.gapic_v1.client_info import ClientInfo
 from config import settings
 from app.utils.auth import vertex_auth
 from app.schemas.invoice_schema import InvoiceSchema
@@ -19,7 +20,8 @@ class GeminiService:
         self.model_name = settings.gemini_model
         self.timeout_seconds = settings.gemini_timeout_seconds
         self.model = None
-        self.semaphore = asyncio.Semaphore(settings.gemini_concurrency_limit)
+        self._semaphore: Optional[asyncio.Semaphore] = None  # lazy: created inside running loop
+        self._semaphore_limit = settings.gemini_concurrency_limit
         
         # Configuración para forzar respuestas JSON limpias (sin markdown)
         self.generation_config = GenerationConfig(
@@ -65,12 +67,11 @@ Rules:
 """
     
     def initialize_model(self) -> bool:
-        """Initialize the Gemini model"""
+        """Initialize the Gemini model (must be called inside run_in_executor)"""
         try:
-            print("se esta inizando vertex ai")
+            logger.log_info("Initializing Vertex AI + Gemini model", model_name=self.model_name)
             if not vertex_auth.initialize_vertex_ai():
                 return False
-            print("bbbbb se esta inizando vertex ai")
 
             self.model = GenerativeModel(self.model_name)
             
@@ -90,6 +91,12 @@ Rules:
             )
             return False
     
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        """Return semaphore, creating it inside the running event loop on first access."""
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._semaphore_limit)
+        return self._semaphore
+
     def prepare_image_part(self, image_base64: str, mime_type: str) -> Part:
         """Prepare image part for Gemini"""
         import base64
@@ -100,19 +107,11 @@ Rules:
                                        sequence_id: int) -> Dict:
         """Extract invoice data from image using Gemini"""
 
-        async with self.semaphore:  # Control concurrency
-            print ("semafoorooooo")
+        async with self._get_semaphore():  # created lazily inside running loop
             try:
-                if not self.model:
-                    if not self.initialize_model():
-                        return self._create_error_response(
-                            "Gemini model not initialized", filename, sequence_id
-                        )
-                
                 # Prepare image part
                 image_part = self.prepare_image_part(image_base64, "image/jpeg")
                 
-                # Generate content
                 logger.log_file_processing(
                     filename=filename,
                     sequence_id=sequence_id,
@@ -120,9 +119,19 @@ Rules:
                     status="sending_to_gemini"
                 )
 
+                # Initialize model inside executor on first call (never blocks event loop)
+                if not self.model:
+                    logger.log_info("Model not initialized, initializing in executor...", filename=filename)
+                    loop = asyncio.get_running_loop()
+                    ok = await loop.run_in_executor(None, self.initialize_model)
+                    if not ok:
+                        return self._create_error_response(
+                            "Gemini model not initialized", filename, sequence_id
+                        )
+
                 response = await asyncio.wait_for(
                     self._call_gemini_async(image_part, self.invoice_prompt),
-                    timeout=self.timeout_seconds
+                    timeout=self.timeout_seconds + 10,  # outer guard > gRPC timeout
                 )
                 
                 # Delay conservador para 15 RPM (6s = ~10 requests/min con margen de seguridad)
@@ -158,14 +167,8 @@ Rules:
                                       sequence_id: int) -> Dict:
         """Extract invoice data from PDF using Gemini"""
         
-        async with self.semaphore:
+        async with self._get_semaphore():
             try:
-                if not self.model:
-                    if not self.initialize_model():
-                        return self._create_error_response(
-                            "Gemini model not initialized", filename, sequence_id
-                        )
-                
                 # Prepare PDF part
                 pdf_part = self.prepare_image_part(pdf_base64, "application/pdf")
                 
@@ -176,10 +179,19 @@ Rules:
                     status="sending_to_gemini"
                 )
                 
-                # Generate content from PDF
+                # Initialize model inside executor on first call (never blocks event loop)
+                if not self.model:
+                    logger.log_info("Model not initialized, initializing in executor...", filename=filename)
+                    loop = asyncio.get_running_loop()
+                    ok = await loop.run_in_executor(None, self.initialize_model)
+                    if not ok:
+                        return self._create_error_response(
+                            "Gemini model not initialized", filename, sequence_id
+                        )
+
                 response = await asyncio.wait_for(
                     self._call_gemini_async(pdf_part, self.invoice_prompt),
-                    timeout=self.timeout_seconds
+                    timeout=self.timeout_seconds + 10,
                 )
                 
                 # Delay conservador para 15 RPM (6s = ~10 requests/min con margen de seguridad)
@@ -213,14 +225,8 @@ Rules:
                                       sequence_id: int) -> Dict:
         """Extract invoice data from text content"""
         
-        async with self.semaphore:
+        async with self._get_semaphore():
             try:
-                if not self.model:
-                    if not self.initialize_model():
-                        return self._create_error_response(
-                            "Gemini model not initialized", filename, sequence_id
-                        )
-                
                 # Create text-specific prompt
                 text_prompt = f"""\nAnalyze this text and extract invoice information. Return ONLY a JSON object with the same structure as requested for images.\n\nText content:\n{text_content}\n\n{self.invoice_prompt}"""
                 
@@ -232,9 +238,19 @@ Rules:
                     content_length=len(text_content)
                 )
                 
+                # Initialize model inside executor on first call (never blocks event loop)
+                if not self.model:
+                    logger.log_info("Model not initialized, initializing in executor...", filename=filename)
+                    loop = asyncio.get_running_loop()
+                    ok = await loop.run_in_executor(None, self.initialize_model)
+                    if not ok:
+                        return self._create_error_response(
+                            "Gemini model not initialized", filename, sequence_id
+                        )
+
                 response = await asyncio.wait_for(
                     self._call_gemini_text_async(text_prompt),
-                    timeout=self.timeout_seconds
+                    timeout=self.timeout_seconds + 10,
                 )
                 
                 # Delay conservador para 15 RPM (6s = ~10 requests/min con margen de seguridad)
@@ -261,14 +277,17 @@ Rules:
         for attempt in range(max_retries):
             try:
                 def _sync_call():
+                    # Lazy init inside executor so it never blocks the event loop
+                    if not self.model:
+                        self.initialize_model()
                     response = self.model.generate_content(
                         [image_part, prompt],
-                        generation_config=self.generation_config
+                        generation_config=self.generation_config,
                     )
                     return response.text
                 
-                # Run in thread pool to avoid blocking
-                loop = asyncio.get_event_loop()
+                # Run in thread pool to avoid blocking the event loop
+                loop = asyncio.get_running_loop()
                 return await loop.run_in_executor(None, _sync_call)
 
             except Exception as e:
@@ -306,13 +325,16 @@ Rules:
         for attempt in range(max_retries):
             try:
                 def _sync_call():
+                    # Lazy init inside executor so it never blocks the event loop
+                    if not self.model:
+                        self.initialize_model()
                     response = self.model.generate_content(
                         prompt,
-                        generation_config=self.generation_config
+                        generation_config=self.generation_config,
                     )
                     return response.text
                 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 return await loop.run_in_executor(None, _sync_call)
                 
             except Exception as e:

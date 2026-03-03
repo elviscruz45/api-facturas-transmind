@@ -2,6 +2,7 @@ from google.cloud import aiplatform
 from google.auth import default
 from google.auth.exceptions import DefaultCredentialsError
 from google.oauth2.service_account import Credentials
+import vertexai
 import os
 from config import settings
 from app.utils.logger import setup_logger
@@ -19,18 +20,14 @@ class VertexAIAuth:
     def initialize_credentials(self) -> bool:
         """Initialize Google Cloud credentials using ADC or service account"""
         try:
-            print("111111 google auth")
-
             # Try explicit service account file first (avoids blocking on metadata server)
             sa_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or settings.google_application_credentials
             
             if sa_path and os.path.exists(sa_path):
-                print(f"Loading credentials from file: {sa_path}")
                 self.credentials = Credentials.from_service_account_file(sa_path)
                 
                 # Get project from file or settings
                 if not self.project_id:
-                    # Try to read project from service account file
                     import json
                     with open(sa_path, 'r') as f:
                         sa_data = json.load(f)
@@ -42,26 +39,20 @@ class VertexAIAuth:
                     location=self.location,
                     auth_method="service_account_file"
                 )
-                print("222222 google auth (from file)")
                 return True
             
-            print("No service account file found, trying ADC...")
-            # Fallback: Try Application Default Credentials
+            # Fallback: Application Default Credentials (used automatically in Cloud Run)
             credentials, project = default()
-            print("222222 google auth (from ADC)")
 
-            # If project not found in credentials, use from settings
             if not project and self.project_id:
                 project = self.project_id
             elif project and not self.project_id:
                 self.project_id = project
-            print("33333 google auth")
 
             self.credentials = credentials
-            print("44444 google auth")
 
             logger.log_info(
-                "Vertex AI credentials initialized successfully",
+                "Vertex AI credentials initialized via ADC",
                 project_id=self.project_id,
                 location=self.location,
                 auth_method="ADC"
@@ -86,15 +77,16 @@ class VertexAIAuth:
     
     def initialize_vertex_ai(self) -> bool:
         """Initialize Vertex AI platform"""
-        print("111111 vertex ai")
-
         if not self.initialize_credentials():
             return False
         
-        print("22222 vertex ai")
-
-        
         try:
+            # Initialize both SDKs — vertexai.generative_models requires vertexai.init()
+            vertexai.init(
+                project=self.project_id,
+                location=self.location,
+                credentials=self.credentials
+            )
             aiplatform.init(
                 project=self.project_id,
                 location=self.location,

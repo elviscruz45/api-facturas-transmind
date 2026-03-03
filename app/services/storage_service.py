@@ -25,29 +25,59 @@ class StorageService:
     def initialize(self) -> bool:
         """Initialize Cloud Storage client and bucket"""
         try:
-            # Initialize client - usa ADC (Application Default Credentials)
-            self.client = storage.Client(project=self.project_id)
+            # Check if service account credentials are configured
+            service_account_path = settings.google_application_credentials
             
-            # Detectar si podemos generar signed URLs
-            try:
-                # Test si las credenciales pueden firmar
-                creds = self.client._credentials
-                if hasattr(creds, 'sign_bytes') or isinstance(creds, service_account.Credentials):
-                    self.can_sign_urls = True
-                    logger.log_info("Service account credentials detected - signed URLs available")
-                else:
+            if service_account_path and os.path.exists(service_account_path):
+                # Use service account credentials (enables signed URLs)
+                logger.log_info(
+                    "Loading service account credentials",
+                    credentials_path=service_account_path
+                )
+                credentials = service_account.Credentials.from_service_account_file(
+                    service_account_path
+                )
+                self.client = storage.Client(
+                    project=self.project_id,
+                    credentials=credentials
+                )
+                self.can_sign_urls = True
+                logger.log_info("✅ Service account credentials loaded - signed URLs enabled")
+            else:
+                # Use Application Default Credentials (may not support signed URLs)
+                logger.log_info(
+                    "Using Application Default Credentials",
+                    service_account_path=service_account_path or "not_configured"
+                )
+                self.client = storage.Client(project=self.project_id)
+                
+                # Detectar si podemos generar signed URLs
+                try:
+                    creds = self.client._credentials
+                    if hasattr(creds, 'sign_bytes') or isinstance(creds, service_account.Credentials):
+                        self.can_sign_urls = True
+                        logger.log_info("✅ Credentials support signing - signed URLs available")
+                    else:
+                        self.can_sign_urls = False
+                        logger.log_warning(
+                            "⚠️ Credentials do not support signing - signed URLs disabled",
+                            credentials_type=type(creds).__name__,
+                            suggestion="Configure GOOGLE_APPLICATION_CREDENTIALS to enable signed URLs"
+                        )
+                except Exception as e:
                     self.can_sign_urls = False
-                    logger.log_info("User credentials detected - signed URLs not available, using public URLs")
-            except Exception:
-                self.can_sign_urls = False
-                logger.log_info("Could not detect credential type - signed URLs disabled")
+                    logger.log_warning(
+                        "⚠️ Could not detect credential signing capability",
+                        error=str(e)
+                    )
             
             # Get or create bucket
             try:
                 self.bucket = self.client.get_bucket(self.bucket_name)
                 logger.log_info(
                     "Cloud Storage bucket found",
-                    bucket_name=self.bucket_name
+                    bucket_name=self.bucket_name,
+                    can_sign_urls=self.can_sign_urls
                 )
             except Exception:
                 # Bucket doesn't exist, create it
@@ -66,7 +96,8 @@ class StorageService:
                 logger.log_info(
                     "Cloud Storage bucket created",
                     bucket_name=self.bucket_name,
-                    location="us-east4"
+                    location="us-east4",
+                    can_sign_urls=self.can_sign_urls
                 )
             
             return True
@@ -74,7 +105,13 @@ class StorageService:
         except Exception as e:
             logger.log_error(
                 "Failed to initialize Cloud Storage",
-                error=str(e)
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            import traceback
+            logger.log_error(
+                "Initialization traceback",
+                traceback=traceback.format_exc()
             )
             return False
     
@@ -234,6 +271,113 @@ class StorageService:
             logger.log_error(
                 "Failed to upload Excel to Cloud Storage",
                 error=str(e)
+            )
+            return None
+    
+    def upload_report_excel(self, excel_bytes: io.BytesIO, filename: str,
+                           phone_number: Optional[str] = None,
+                           metadata: Optional[Dict] = None) -> Optional[Dict]:
+        """
+        Upload Excel report to Cloud Storage with automatic URL generation fallback
+        
+        Args:
+            excel_bytes: Excel file as BytesIO
+            filename: Report filename
+            phone_number: Optional phone number/company ID
+            metadata: Optional metadata dict to attach to blob
+            
+        Returns:
+            Dict with upload metadata including file_url, or None if failed
+        """
+        if not self.bucket:
+            if not self.initialize():
+                logger.log_error("Cannot upload report - storage not initialized")
+                return None
+        
+        try:
+            import uuid
+            
+            # Generate unique path for report
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            company_prefix = f"reports/{phone_number}/" if phone_number else "reports/all/"
+            year_month = datetime.now().strftime("%Y/%m")
+            report_uuid = str(uuid.uuid4())[:8]
+            blob_path = f"{company_prefix}{year_month}/{timestamp}_{report_uuid}_{filename}"
+            
+            # Create blob
+            blob = self.bucket.blob(blob_path)
+            
+            # Set metadata
+            blob.metadata = metadata or {}
+            blob.metadata.update({
+                "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "generated_at": timestamp,
+                "filename": filename
+            })
+            
+            # Upload Excel
+            excel_bytes.seek(0)
+            blob.upload_from_file(
+                excel_bytes,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+            
+            logger.log_info(
+                "Report uploaded to Cloud Storage",
+                blob_path=blob_path,
+                phone_number=phone_number or "all"
+            )
+            
+            # Generate URL with automatic fallback
+            file_url = self._generate_url_with_fallback(blob, days=7)
+            
+            # Determine URL type based on what we got
+            url_type = "unknown"
+            expires_in = "unknown"
+            access = "unknown"
+            
+            if file_url:
+                if "X-Goog-Signature" in file_url:
+                    url_type = "signed_url"
+                    expires_in = "7 days"
+                    access = "temporary"
+                elif file_url.startswith("gs://"):
+                    url_type = "gs_uri"
+                    expires_in = "N/A"
+                    access = "requires_auth"
+                else:
+                    url_type = "public_url"
+                    expires_in = "permanent"
+                    access = "public"
+            
+            logger.log_info(
+                "Report URL generated",
+                url_type=url_type,
+                can_sign_urls=self.can_sign_urls,
+                blob_path=blob_path
+            )
+            
+            return {
+                "blob_path": blob_path,
+                "file_url": file_url,
+                "filename": filename,
+                "url_type": url_type,
+                "expires_in": expires_in,
+                "access": access,
+                "generated_at": timestamp
+            }
+            
+        except Exception as e:
+            logger.log_error(
+                "Failed to upload report to Cloud Storage",
+                filename=filename,
+                error=str(e),
+                error_type=type(e).__name__
+            )
+            import traceback
+            logger.log_error(
+                "Upload traceback",
+                traceback=traceback.format_exc()
             )
             return None
     

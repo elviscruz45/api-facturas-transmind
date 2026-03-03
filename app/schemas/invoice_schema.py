@@ -81,6 +81,11 @@ class SaveInvoiceRequest(BaseModel):
     total: Optional[float] = None
     currency: Optional[str] = "PEN"
     
+    # Additional fields required by frontend
+    cc_or_placa: Optional[str] = None  # CC (Centro de Costos) or Placa
+    document_type: Optional[str] = None  # Type of document
+    tipo_costo: Optional[str] = None  # Cost type
+    
     # Items (Spanish field names)
     items: Optional[List[WhatsAppInvoiceItem]] = None
     
