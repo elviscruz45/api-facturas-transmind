@@ -26,8 +26,8 @@ ENV/
 env/
 .venv
 
-# Poetry
-poetry.lock
+# poetry.lock SÍ va al repo → builds reproducibles
+# (eliminado de la lista de ignorados)
 
 # IDE
 .vscode/

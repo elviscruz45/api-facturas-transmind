@@ -1,9 +1,8 @@
-# Python
+# Python bytecode
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
 *.egg-info/
 dist/
 build/
@@ -13,9 +12,6 @@ venv/
 env/
 ENV/
 .venv
-
-# Poetry
-poetry.lock
 
 # IDE
 .vscode/
@@ -28,15 +24,12 @@ poetry.lock
 .gitignore
 .gitattributes
 
-# Environment files
+# Secrets / credentials (NEVER en la imagen)
 .env
 .env.local
-.env.*.local
-
-# Google Cloud credentials (NEVER include in image)
+.env.*
 *.json
 !pyproject.toml
-facturacion-*.json
 credentials/
 service-account*.json
 
@@ -44,33 +37,29 @@ service-account*.json
 *.log
 logs/
 
-# Test and development
+# Tests
 .pytest_cache/
 .coverage
 htmlcov/
 tests/
-test_*.py
-*_test.py
 
-# Temporary files
+# Temporales
 tmp/
 temp/
 *.tmp
-/tmp/
-
-# Documentation
-README.md
-docs/
-*.md
-
-# Docker
-Dockerfile
-docker-compose*.yml
-.dockerignore
 
 # OS
 .DS_Store
 Thumbs.db
 
+# Docs (no necesarios en la imagen)
+*.md
+docs/
+
+# Scripts de deploy (no necesarios en la imagen)
+deploy.sh
+deploy_gcp.sh
+
 # Application specific
 /invoice_processing/
+dump.rdb
