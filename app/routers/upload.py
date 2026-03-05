@@ -9,6 +9,7 @@ from app.schemas.invoice_schema import ProcessingResponse, InvoiceSchema, SaveIn
 from app.utils.logger import setup_logger
 from config import settings
 import time
+import json
 from pydantic import BaseModel, HttpUrl, model_validator
 from typing import Optional
 import io
@@ -134,7 +135,6 @@ async def _process_pdf_gemini(pdf_base64: str, filename: str) -> dict:
         filename=filename
     )
     return result
-    return gemini_result
 
 def create_excel_from_results(processing_response: ProcessingResponse, filename: str) -> io.BytesIO:
     """Convert processing results to Excel file"""
@@ -793,9 +793,20 @@ async def process_image_url(request: MediaUrlRequest):
             "data": result.get('invoice_data') if is_success else None,
             "error": result.get('error') if not is_success else None
         }
-        
+
+        logger.log_info(
+            "📤 [RESPONSE] Payload being sent to frontend/callback",
+            filename=filename,
+            phone_number=request.phoneNumber,
+            response_status=response_payload["status"],
+            has_data=response_payload["data"] is not None,
+            invoice_data_keys=list(response_payload["data"].keys()) if response_payload["data"] else [],
+            invoice_data=json.dumps(response_payload["data"], ensure_ascii=False, default=str) if response_payload["data"] else None
+        )
+
         # Send callback if URL provided
         if request.callbackUrl:
+            logger.log_info("📡 [CALLBACK] Sending to", callback_url=request.callbackUrl)
             await send_callback(request.callbackUrl, response_payload)
         
         # Return response
@@ -995,9 +1006,20 @@ async def process_pdf_url(request: MediaUrlRequest):
             "data": result.get('invoice_data') if is_success else None,
             "error": result.get('error') if not is_success else None
         }
-        
+
+        logger.log_info(
+            "📤 [RESPONSE] Payload being sent to frontend/callback",
+            filename=filename,
+            phone_number=request.phoneNumber,
+            response_status=response_payload["status"],
+            has_data=response_payload["data"] is not None,
+            invoice_data_keys=list(response_payload["data"].keys()) if response_payload["data"] else [],
+            invoice_data=json.dumps(response_payload["data"], ensure_ascii=False, default=str) if response_payload["data"] else None
+        )
+
         # Send callback if URL provided
         if request.callbackUrl:
+            logger.log_info("📡 [CALLBACK] Sending to", callback_url=request.callbackUrl)
             await send_callback(request.callbackUrl, response_payload)
         
         # Return response
