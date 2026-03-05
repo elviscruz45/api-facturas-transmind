@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import List, Dict
 from app.models.file_index import FileRecord
 from app.processors.file_sorter import FileSorter
@@ -24,9 +25,9 @@ class ProcessingOrchestrator:
     
     async def process_extracted_files(self, extracted_files: List[Dict]) -> ProcessingResponse:
         """Main orchestration method to process all files"""
-        
+        pipeline_start = time.time()
         logger.log_info(
-            "Starting invoice processing pipeline",
+            "🚀 Starting invoice processing pipeline",
             total_files=len(extracted_files)
         )
         
@@ -48,10 +49,15 @@ class ProcessingOrchestrator:
             results = []
             errors = []
             
-            for file_record in processable_files:
+            # Procesar archivos en paralelo (el semáforo de Gemini controla la concurrencia real)
+            tasks = [self.process_single_file(f) for f in processable_files]
+            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for file_record, result in zip(processable_files, raw_results):
                 try:
-                    result = await self.process_single_file(file_record)
-                    
+                    if isinstance(result, Exception):
+                        raise result
+
                     if result["success"]:
                         results.append(result["invoice_data"])
                         logger.log_file_processing(
@@ -68,7 +74,7 @@ class ProcessingOrchestrator:
                             "file_type": file_record.file_type,
                             "error": result.get("error", "Unknown error")
                         })
-                        
+
                         logger.log_file_processing(
                             filename=file_record.filename,
                             sequence_id=file_record.sequence_id,
@@ -77,7 +83,7 @@ class ProcessingOrchestrator:
                             success=False,
                             error=result.get("error")
                         )
-                
+
                 except Exception as e:
                     error_info = {
                         "file": file_record.filename,
@@ -86,7 +92,7 @@ class ProcessingOrchestrator:
                         "error": str(e)
                     }
                     errors.append(error_info)
-                    
+
                     logger.log_error(
                         "Single file processing failed",
                         filename=file_record.filename,
@@ -102,13 +108,16 @@ class ProcessingOrchestrator:
                 success_count=len(results)
             )
             
+            pipeline_elapsed = time.time() - pipeline_start
+
             logger.log_info(
-                "Invoice processing pipeline completed",
+                "✅ Invoice processing pipeline completed",
                 total_files=len(extracted_files),
                 processable_files=len(processable_files),
                 successful_extractions=len(results),
                 errors=len(errors),
-                success_rate=f"{(len(results)/len(processable_files)*100):.1f}%" if processable_files else "0%"
+                success_rate=f"{(len(results)/len(processable_files)*100):.1f}%" if processable_files else "0%",
+                total_elapsed_s=round(pipeline_elapsed, 2)
             )
             
             return response
@@ -130,128 +139,147 @@ class ProcessingOrchestrator:
     
     async def process_single_file(self, file_record: FileRecord) -> Dict:
         """Process a single file based on its type"""
-        
+        file_start = time.time()
         logger.log_file_processing(
             filename=file_record.filename,
             sequence_id=file_record.sequence_id,
             file_type=file_record.file_type,
             status="processing_started"
         )
-        
+
         try:
             if file_record.file_type == "text":
-                return await self.process_text_file(file_record)
-            
+                result = await self.process_text_file(file_record)
             elif file_record.file_type == "image":
-                return await self.process_image_file(file_record)
-            
+                result = await self.process_image_file(file_record)
             elif file_record.file_type == "pdf":
-                return await self.process_pdf_file(file_record)
-            
+                result = await self.process_pdf_file(file_record)
             else:
-                return {
-                    "success": False,
-                    "error": f"Unsupported file type: {file_record.file_type}"
-                }
-        
+                return {"success": False, "error": f"Unsupported file type: {file_record.file_type}"}
+
+            elapsed = round(time.time() - file_start, 2)
+            engine = result.get("extraction_method", "gemini")
+            confidence = result.get("invoice_data", {}).get("confidence_score", 0.0) if result.get("success") else 0.0
+            icon = "⚡" if "ocr" in engine else "🤖"
+            logger.log_info(
+                f"{icon} [{engine.upper()}] {file_record.filename} → {elapsed}s | confidence={confidence}",
+                filename=file_record.filename,
+                sequence_id=file_record.sequence_id,
+                engine=engine,
+                elapsed_s=elapsed,
+                confidence=confidence,
+                success=result.get("success")
+            )
+            return result
+
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
+            elapsed = round(time.time() - file_start, 2)
+            logger.log_error(
+                f"❌ File processing crashed after {elapsed}s",
+                filename=file_record.filename,
+                elapsed_s=elapsed,
+                error=str(e)
+            )
+            return {"success": False, "error": str(e)}
     
     async def process_text_file(self, file_record: FileRecord) -> Dict:
-        """Process text file"""
+        """Process text file — Gemini directo."""
         try:
-            # Extract text content
             result = self.text_processor.process_text_file(file_record.file_path)
-            
             if not result["success"]:
                 return result
-            
+
             text_content = result["content"]
-            
-            # Check if it's potentially an invoice
+
             if not result.get("is_potential_invoice", False):
-                # Create low-confidence response
                 low_conf_invoice = InvoiceSchema(
                     confidence_score=0.1,
                     source_file=file_record.filename,
                     sequence_id=file_record.sequence_id
                 )
-                
                 return {
                     "success": True,
                     "invoice_data": low_conf_invoice.dict(),
                     "note": "Text does not appear to contain invoice data"
                 }
-            
-            # Send to Gemini for structured extraction
+
+            t0 = time.time()
+            logger.log_info("🤖 [GEMINI] processing text file", filename=file_record.filename)
             gemini_result = await gemini_service.extract_invoice_from_text(
                 text_content, file_record.filename, file_record.sequence_id
             )
-            
+            gemini_result["extraction_method"] = "gemini_text"
+            logger.log_info(
+                f"🤖 [GEMINI] text done in {round(time.time()-t0, 1)}s",
+                filename=file_record.filename
+            )
             return gemini_result
-            
+
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"Text processing failed: {str(e)}"
-            }
+            return {"success": False, "error": f"Text processing failed: {str(e)}"}
     
     async def process_image_file(self, file_record: FileRecord) -> Dict:
-        """Process image file"""
+        """
+        Process image — Gemini Vision directo.
+        OCR no aplica para imágenes de WhatsApp: compresión JPEG, ángulos,
+        sombras → confidence bajo → igual cae al fallback, sumando latencia.
+        OCR-first sí aplica para PDFs digitales SUNAT (texto puro estructurado).
+        """
         try:
-            # Prepare image for Gemini
             prep_result = self.image_processor.prepare_image_for_gemini(file_record.file_path)
-            
             if not prep_result["success"]:
                 return prep_result
-            
-            
-            # Send to Gemini
-            gemini_result = await gemini_service.extract_invoice_from_image(
-                prep_result["image_data"],
-                file_record.filename,
-                file_record.sequence_id
+
+            image_data = prep_result["image_data"]
+
+            t0 = time.time()
+            logger.log_info(
+                "🤖 [GEMINI VISION] processing image",
+                filename=file_record.filename
             )
-            
+            gemini_result = await gemini_service.extract_invoice_from_image(
+                image_data, file_record.filename, file_record.sequence_id
+            )
+            gemini_result["extraction_method"] = "gemini_vision"
+            logger.log_info(
+                f"🤖 [GEMINI VISION] done in {round(time.time()-t0, 1)}s",
+                filename=file_record.filename
+            )
             return gemini_result
-            
+
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"Image processing failed: {str(e)}"
-            }
+            return {"success": False, "error": f"Image processing failed: {str(e)}"}
     
     async def process_pdf_file(self, file_record: FileRecord) -> Dict:
-        """Process PDF file"""
+        """Process PDF — Gemini directo."""
         try:
-            # Process PDF (detect text vs scanned)
             pdf_result = self.pdf_processor.process_pdf_file(file_record.file_path)
-            
             if not pdf_result["success"]:
                 return pdf_result
-            
-            if pdf_result["processing_type"] == "text_extraction":
-                # Text-based PDF - send text to Gemini
-                text_content = pdf_result["content"]
+
+            t0 = time.time()
+            logger.log_info("🤖 [GEMINI PDF] processing PDF", filename=file_record.filename)
+
+            # Usar base64 del PDF si está disponible, sino texto extraído
+            if pdf_result.get("pdf_base64"):
+                gemini_result = await gemini_service.extract_invoice_from_pdf(
+                    pdf_result["pdf_base64"], file_record.filename, file_record.sequence_id
+                )
+            else:
+                text_content = pdf_result.get("content", "")
                 gemini_result = await gemini_service.extract_invoice_from_text(
                     text_content, file_record.filename, file_record.sequence_id
                 )
-                return gemini_result
-            
-            else:
-                return {
-                    "success": False,
-                    "error": "Scanned PDF processing not available in MVP"
-                }
-            
+
+            gemini_result["extraction_method"] = "gemini_pdf"
+            logger.log_info(
+                f"🤖 [GEMINI PDF] done in {round(time.time()-t0, 1)}s",
+                filename=file_record.filename
+            )
+            return gemini_result
+
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"PDF processing failed: {str(e)}"
-            }
+            return {"success": False, "error": f"PDF processing failed: {str(e)}"}
 
 # Global orchestrator instance
 orchestrator = ProcessingOrchestrator()

@@ -64,6 +64,12 @@ Rules:
 - Set confidence_score based on text clarity and completeness
 - If no invoice data is found, set confidence_score to 0.0
 - Return ONLY the JSON, no additional text or markdown
+
+CRITICAL — Supplier vs Customer (error muy común en facturas peruanas):
+- El SUPPLIER (emisor) es la empresa que EMITE la factura. Su nombre y RUC aparecen en el ENCABEZADO, frecuentemente dentro o junto al LOGOTIPO de la empresa en la parte superior del documento. La zona del logo casi siempre contiene el nombre del emisor — úsala para identificar supplier_name y supplier_ruc.
+- El CUSTOMER (cliente/receptor) es la empresa que RECIBE la factura. Sus datos aparecen en una sección etiquetada 'CLIENTE:', 'RECEPTOR:', 'SEÑOR(ES):', 'ADQUIRIENTE:' o similar, típicamente DEBAJO del encabezado.
+- Si ves dos RUC en el documento: el que está en la zona del logo/encabezado es supplier_ruc; el que está en la sección cliente NO es supplier_ruc.
+- El RUC del emisor siempre tiene exactamente 11 dígitos y empieza con 10 (persona natural) o 20 (empresa).
 """
     
     def initialize_model(self) -> bool:

@@ -7,6 +7,8 @@ from app.services.supabase_service import supabase_service
 from app.services.gemini_service import gemini_service
 from app.schemas.invoice_schema import ProcessingResponse, InvoiceSchema, SaveInvoiceRequest, SaveInvoiceResponse
 from app.utils.logger import setup_logger
+from config import settings
+import time
 from pydantic import BaseModel, HttpUrl, model_validator
 from typing import Optional
 import io
@@ -92,6 +94,47 @@ async def send_callback(callback_url: str, payload: dict) -> None:
             callback_url=callback_url,
             error=str(e)
         )
+
+
+async def _process_image_ocr_first(image_base64: str, filename: str) -> dict:
+    """
+    Imágenes de WhatsApp → Gemini directo.
+    OCR no aplica: WhatsApp comprime las imágenes (JPEG con artefactos, ángulos,
+    sombras) → confidence bajo → igual cae al fallback, sumando latencia innecesaria.
+    El OCR-first sí aplica para PDFs digitales SUNAT (texto puro estructurado).
+    """
+    t0 = time.time()
+    logger.log_info("🤖 [GEMINI VISION] processing image", filename=filename)
+    result = await gemini_service.extract_invoice_from_image(
+        image_base64=image_base64,
+        filename=filename,
+        sequence_id=1
+    )
+    result["extraction_method"] = "gemini_vision"
+    logger.log_info(
+        f"🤖 [GEMINI VISION] done in {round(time.time()-t0, 1)}s",
+        filename=filename,
+        elapsed_s=round(time.time()-t0, 1)
+    )
+    return result
+
+
+async def _process_pdf_gemini(pdf_base64: str, filename: str) -> dict:
+    """Procesa un PDF enviándolo directamente a Gemini."""
+    t0 = time.time()
+    logger.log_info("🤖 [GEMINI PDF] sending PDF to Gemini", filename=filename)
+    result = await gemini_service.extract_invoice_from_pdf(
+        pdf_base64=pdf_base64,
+        filename=filename,
+        sequence_id=1
+    )
+    result["extraction_method"] = "gemini_pdf"
+    logger.log_info(
+        f"🤖 [GEMINI PDF] done in {round(time.time()-t0, 1)}s",
+        filename=filename
+    )
+    return result
+    return gemini_result
 
 def create_excel_from_results(processing_response: ProcessingResponse, filename: str) -> io.BytesIO:
     """Convert processing results to Excel file"""
@@ -631,34 +674,45 @@ async def process_image(file: Optional[UploadFile] = File(None)):
             size_bytes=len(file_content)
         )
         
+        # Upload original file to Cloud Storage (async, non-blocking failure)
+        mime_type = file.content_type or "image/jpeg"
+        gcs_meta = storage_service.upload_invoice_file(
+            file_content=file_content,
+            filename=file.filename,
+            phone_number=None,
+            mime_type=mime_type
+        )
+
         # Convert to base64
         image_base64 = base64.b64encode(file_content).decode('utf-8')
-        
-        # Process with Gemini
-        result = await gemini_service.extract_invoice_from_image(
-            image_base64=image_base64,
-            filename=file.filename,
-            sequence_id=1
-        )
-        
+
+        result = await _process_image_ocr_first(image_base64, file.filename)
+
+        # Inject GCS URL into invoice_data so it reaches Supabase via /save-invoice
+        if gcs_meta and result.get('invoice_data') is not None:
+            result['invoice_data']['source_url'] = gcs_meta['signed_url']
+            result['invoice_data']['blob_path'] = gcs_meta['blob_path']
+
         logger.log_info(
             "Image processing completed",
             filename=file.filename,
-            success=result.get('success', False)
+            engine=result.get('extraction_method', 'gemini'),
+            success=result.get('success', False),
+            gcs_uploaded=bool(gcs_meta)
         )
-        
+
         return result
-        
+
     except HTTPException:
         raise
-        
+
     except Exception as e:
         logger.log_error(
             "Unexpected error during image processing",
             filename=file.filename if file else "unknown",
             error=str(e)
         )
-        
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}"
@@ -699,28 +753,39 @@ async def process_image_url(request: MediaUrlRequest):
             phone_number=request.phoneNumber
         )
         
+        # Upload original file to Cloud Storage
+        mime_type = request.mimeType or "image/jpeg"
+        gcs_meta = storage_service.upload_invoice_file(
+            file_content=file_content,
+            filename=filename,
+            phone_number=request.phoneNumber,
+            mime_type=mime_type
+        )
+
         # Convert to base64
         image_base64 = base64.b64encode(file_content).decode('utf-8')
-        
-        # Process with Gemini
-        result = await gemini_service.extract_invoice_from_image(
-            image_base64=image_base64,
-            filename=filename,
-            sequence_id=1
-        )
-        
-        print("resulttttttttttttt", result)
+
+        result = await _process_image_ocr_first(image_base64, filename)
+
+        # Inject GCS URL into invoice_data so it reaches Supabase via /save-invoice
+        if gcs_meta and result.get('invoice_data') is not None:
+            result['invoice_data']['source_url'] = gcs_meta['signed_url']
+            result['invoice_data']['blob_path'] = gcs_meta['blob_path']
+
         logger.log_info(
             "Image URL processing completed",
             filename=filename,
             phone_number=request.phoneNumber,
-            success=result.get('success', False)
+            engine=result.get('extraction_method', 'gemini'),
+            success=result.get('success', False),
+            gcs_uploaded=bool(gcs_meta),
+            gcs_blob=gcs_meta['blob_path'] if gcs_meta else None
         )
-        
+
         # Prepare response payload
         job_id = f"job_{int(datetime.now().timestamp() * 1000)}"
         is_success = result.get('success', False)
-        
+
         response_payload = {
             "jobId": job_id,
             "status": "success" if is_success else "error",
@@ -804,34 +869,48 @@ async def process_pdf(file: Optional[UploadFile] = File(None)):
             size_bytes=len(file_content)
         )
         
+        # Upload original PDF to Cloud Storage
+        gcs_meta = storage_service.upload_invoice_file(
+            file_content=file_content,
+            filename=file.filename,
+            phone_number=None,
+            mime_type="application/pdf"
+        )
+
         # Convert to base64
         pdf_base64 = base64.b64encode(file_content).decode('utf-8')
-        
-        # Process with Gemini
-        result = await gemini_service.extract_invoice_from_pdf(
-            pdf_base64=pdf_base64,
-            filename=file.filename,
-            sequence_id=1
-        )
-        
+
+        # Process with OCR-first pipeline
+        t0 = time.time()
+        result = await _process_pdf_gemini(pdf_base64, file.filename)
+        elapsed = round(time.time() - t0, 1)
+
+        # Inject GCS URL into invoice_data
+        if gcs_meta and result.get('invoice_data') is not None:
+            result['invoice_data']['source_url'] = gcs_meta['signed_url']
+            result['invoice_data']['blob_path'] = gcs_meta['blob_path']
+
         logger.log_info(
             "PDF processing completed",
             filename=file.filename,
-            success=result.get('success', False)
+            success=result.get('success', False),
+            engine=result.get('extraction_method', 'unknown'),
+            elapsed_s=elapsed,
+            gcs_uploaded=bool(gcs_meta)
         )
-        
+
         return result
-        
+
     except HTTPException:
         raise
-        
+
     except Exception as e:
         logger.log_error(
             "Unexpected error during PDF processing",
             filename=file.filename if file else "unknown",
             error=str(e)
         )
-        
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}"
@@ -872,27 +951,43 @@ async def process_pdf_url(request: MediaUrlRequest):
             phone_number=request.phoneNumber
         )
         
+        # Upload original PDF to Cloud Storage
+        mime_type = request.mimeType or "application/pdf"
+        gcs_meta = storage_service.upload_invoice_file(
+            file_content=file_content,
+            filename=filename,
+            phone_number=request.phoneNumber,
+            mime_type=mime_type
+        )
+
         # Convert to base64
         pdf_base64 = base64.b64encode(file_content).decode('utf-8')
-        
-        # Process with Gemini
-        result = await gemini_service.extract_invoice_from_pdf(
-            pdf_base64=pdf_base64,
-            filename=filename,
-            sequence_id=1
-        )
-        
+
+        # Process with OCR-first pipeline
+        t0 = time.time()
+        result = await _process_pdf_gemini(pdf_base64, filename)
+        elapsed = round(time.time() - t0, 1)
+
+        # Inject GCS URL into invoice_data so it reaches Supabase via /save-invoice
+        if gcs_meta and result.get('invoice_data') is not None:
+            result['invoice_data']['source_url'] = gcs_meta['signed_url']
+            result['invoice_data']['blob_path'] = gcs_meta['blob_path']
+
         logger.log_info(
             "PDF URL processing completed",
             filename=filename,
             phone_number=request.phoneNumber,
-            success=result.get('success', False)
+            success=result.get('success', False),
+            engine=result.get('extraction_method', 'unknown'),
+            elapsed_s=elapsed,
+            gcs_uploaded=bool(gcs_meta),
+            gcs_blob=gcs_meta['blob_path'] if gcs_meta else None
         )
-        
+
         # Prepare response payload
         job_id = f"job_{int(datetime.now().timestamp() * 1000)}"
         is_success = result.get('success', False)
-        
+
         response_payload = {
             "jobId": job_id,
             "status": "success" if is_success else "error",

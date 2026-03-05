@@ -86,10 +86,10 @@ class StorageService:
                     location="us-east4"
                 )
                 
-                # Set lifecycle policy to delete files after 90 days
+                # Set lifecycle policy to delete files after 400 days
                 self.bucket.lifecycle_rules = [{
                     "action": {"type": "Delete"},
-                    "condition": {"age": 90}
+                    "condition": {"age": 450}  # 30 días de margen después de que expira el signed URL (420d)
                 }]
                 self.bucket.patch()
                 
@@ -274,6 +274,75 @@ class StorageService:
             )
             return None
     
+    def upload_invoice_file(
+        self,
+        file_content: bytes,
+        filename: str,
+        phone_number: Optional[str] = None,
+        mime_type: str = "image/jpeg"
+    ) -> Optional[Dict]:
+        """
+        Upload a single invoice file (image or PDF) from WhatsApp to Cloud Storage.
+
+        Args:
+            file_content: Raw bytes of the file
+            filename: Original filename (used in blob path)
+            phone_number: Sender's phone number (used as tenant prefix)
+            mime_type: MIME type of the file
+
+        Returns:
+            Dict with blob_path, signed_url, public_url — or None if upload failed
+        """
+        if not self.bucket:
+            if not self.initialize():
+                return None
+
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            year_month = datetime.now().strftime("%Y/%m")
+            prefix = f"{phone_number}/" if phone_number else "whatsapp/"
+
+            # e.g. 51987654321/2026/03/20260304_153000_invoice.jpg
+            blob_path = f"{prefix}{year_month}/{timestamp}_{filename}"
+
+            blob = self.bucket.blob(blob_path)
+            blob.metadata = {
+                "original_filename": filename,
+                "upload_timestamp": timestamp,
+                "phone_number": phone_number or "unknown",
+                "content_type": mime_type,
+                "source": "whatsapp"
+            }
+
+            blob.upload_from_string(file_content, content_type=mime_type)
+
+            signed_url = self._generate_url_with_fallback(blob, days=420)
+
+            logger.log_info(
+                "✅ Invoice file uploaded to Cloud Storage",
+                blob_path=blob_path,
+                size_bytes=len(file_content),
+                phone_number=phone_number,
+                mime_type=mime_type
+            )
+
+            return {
+                "blob_path": blob_path,
+                "public_url": blob.public_url,
+                "signed_url": signed_url,
+                "size_bytes": len(file_content),
+                "upload_timestamp": timestamp,
+            }
+
+        except Exception as e:
+            logger.log_error(
+                "❌ Failed to upload invoice file to Cloud Storage",
+                filename=filename,
+                phone_number=phone_number,
+                error=str(e)
+            )
+            return None
+
     def upload_report_excel(self, excel_bytes: io.BytesIO, filename: str,
                            phone_number: Optional[str] = None,
                            metadata: Optional[Dict] = None) -> Optional[Dict]:

@@ -167,6 +167,18 @@ Edit `config.py` or use environment variables:
 2. **Authentication Error**: Ensure Google Cloud credentials are properly configured
 3. **Large Files**: Check file size limits and processing timeouts
 4. **Poor Extraction**: Verify image quality and text clarity
+5. **Shapely/Numpy Build Error**: If you encounter `build_wheel` errors, pre-install binary wheels before running `poetry install`:
+   ```bash
+   # If using Python 3.14, switch to 3.13
+   poetry env remove python3.14
+   poetry env use python3.13
+   
+   # Pre-install binary wheels to avoid compilation
+   poetry run pip install --only-binary=:all: numpy shapely
+   
+   # Then install remaining dependencies
+   poetry install
+   ```
 
 ### Logs
 

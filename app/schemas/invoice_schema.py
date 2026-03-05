@@ -18,6 +18,7 @@ class InvoiceSchema(BaseModel):
     supplier_name: Optional[str] = None
     supplier_ruc: Optional[str] = None
     customer_name: Optional[str] = None
+    customer_ruc: Optional[str] = None
     items: Optional[List[InvoiceItemSchema]] = None  # List of line items
     subtotal: Optional[float] = None
     tax: Optional[float] = None
